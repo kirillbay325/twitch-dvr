@@ -1,10 +1,18 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1280" height="400" viewBox="0 0 1280 400" fill="none">
+  <defs>
+    <clipPath id="cardClip">
+      <rect width="1280" height="400" rx="24"/>
+    </clipPath>
+  </defs>
+  <rect width="1280" height="400" fill="#0d1117"/>
   <rect width="1280" height="400" rx="24" fill="#101318"/>
   <rect x="0.5" y="0.5" width="1279" height="399" rx="23.5" stroke="#2f3540"/>
 
-  <circle cx="1120" cy="86" r="250" stroke="#1a2028"/>
-  <circle cx="1120" cy="86" r="180" stroke="#1a2028"/>
-  <circle cx="1120" cy="86" r="110" stroke="#1a2028"/>
+  <g clip-path="url(#cardClip)">
+    <circle cx="1120" cy="86" r="250" stroke="#1a2028"/>
+    <circle cx="1120" cy="86" r="180" stroke="#1a2028"/>
+    <circle cx="1120" cy="86" r="110" stroke="#1a2028"/>
+  </g>
 
   <text x="72" y="86" fill="#8fb0cc" font-family="Segoe UI, Arial, sans-serif" font-size="13" font-weight="700" letter-spacing="3">TWITCH DVR PLAYER</text>
   <text x="72" y="150" fill="#e8edf3" font-family="Segoe UI, Arial, sans-serif" font-size="44" font-weight="700" letter-spacing="-1">Прямой эфир. Полный контроль.</text>

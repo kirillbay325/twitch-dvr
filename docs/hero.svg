@@ -15,7 +15,7 @@
     <text x="88" y="232" fill="#b2cee3">Manifest V3</text>
 
     <rect x="210" y="212" width="154" height="30" rx="8" fill="#171b21" stroke="#2f3540"/>
-    <text x="226" y="232" fill="#b2cee3">Chrome / Yandex</text>
+    <text x="226" y="232" fill="#b2cee3">Chromium</text>
 
     <rect x="374" y="212" width="132" height="30" rx="8" fill="#171b21" stroke="#2f3540"/>
     <text x="390" y="232" fill="#b2cee3">source 1080p</text>

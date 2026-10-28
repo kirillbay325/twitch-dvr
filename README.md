@@ -11,7 +11,7 @@
 </div>
 
 <p align="center">
-  <img src="docs/hero.svg" alt="Превью интерфейса Twitch DVR Player: таймлайн, LIVE, качество и управление звуком" width="100%">
+  <img src="docs/hero.png" alt="Превью интерфейса Twitch DVR Player: таймлайн, LIVE, качество и управление звуком" width="100%">
 </p>
 
 > **Коротко:** расширение заменяет стандартный плеер на странице Twitch-канала на DVR-плеер. В России Twitch ограничивает качество прямого эфира, но запись текущей трансляции отдаёт source — расширение показывает именно её и добавляет нормальный таймлайн, паузу и перемотку. Это не VPN и не прокси.
@@ -269,7 +269,8 @@ twitch-dvr/
 │   ├── icon48.png
 │   └── icon128.png
 ├── docs/
-│   └── hero.svg            # превью для README
+│   ├── hero.svg            # исходник превью
+│   └── hero.png            # превью для README
 ├── scripts/
 │   └── build-css.mjs       # пересборка styles-inline.js
 ├── README.md

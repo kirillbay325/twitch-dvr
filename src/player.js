@@ -16,12 +16,13 @@
   }
   ensureStyles();
 
-  const VERSION = '1.3.7';
+  const VERSION = '1.4.1';
   const CLIENT_ID = 'kimne78kx3ncx6brgo4mv6wki5h1ko';
   const GQL_URL = 'https://gql.twitch.tv/gql';
   const STORAGE = {
     enabled: 'tdvr:enabled',
     quality: 'tdvr:quality',
+    qualityReset: 'tdvr:qualityReset',
     volume: 'tdvr:volume',
     buffer: 'tdvr:buffer',
   };
@@ -37,9 +38,15 @@
   const READY_RETRY_MS = 1100;
   const NETWORK_RETRY_MS = 2200;
   const UI_TICK_MS = 250;
+  const IDLE_HIDE_MS = 3000;
+  const RATE_MIN = 0.1;
+  const RATE_MAX = 3;
+  const RATE_SLIDER_MAX = 200;
+  const RATE_CATCH_UP_SECONDS = 0.5;
   const LIVE_WINDOW_SECONDS = 30;
   const LIVE_INTENT_SECONDS = 12;
   const LIVE_BUFFER_OPTIONS = [5, 10, 20, 30];
+  const LIVE_BUFFER_UNLIMITED = 'unlimited';
   const LIVE_BUFFER_DEFAULT = 600;
   const LIVE_CACHE_SECONDS = 90;
   const LIVE_EVICT_CHUNK_SECONDS = 120;
@@ -99,6 +106,10 @@
     try { localStorage.setItem(key, value); } catch { /* ignored */ }
   }
 
+  function storeRemove(key) {
+    try { localStorage.removeItem(key); } catch { /* ignored */ }
+  }
+
   function formatTime(seconds) {
     if (!Number.isFinite(seconds) || seconds < 0) seconds = 0;
     seconds = Math.floor(seconds);
@@ -107,6 +118,27 @@
     const s = seconds % 60;
     if (h > 0) return `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
     return `${m}:${String(s).padStart(2, '0')}`;
+  }
+
+  function formatRate(rate) {
+    return `${Math.round(rate * 100) / 100}x`;
+  }
+
+  // Symmetric like YouTube's custom-speed slider: 1x sits in the middle, the left
+  // half covers 0.1x..1x and the right half 1x..3x. Rates snap to a 0.05 grid,
+  // which also gives 1x a small dead zone so it is actually reachable.
+  function rateFromSlider(value) {
+    const half = RATE_SLIDER_MAX / 2;
+    const raw = value <= half
+      ? RATE_MIN + (value / half) * (1 - RATE_MIN)
+      : 1 + ((value - half) / half) * (RATE_MAX - 1);
+    return Math.round(raw * 20) / 20;
+  }
+
+  function sliderFromRate(rate) {
+    const half = RATE_SLIDER_MAX / 2;
+    if (rate <= 1) return Math.round(((rate - RATE_MIN) / (1 - RATE_MIN)) * half);
+    return Math.round(half + ((rate - 1) / (RATE_MAX - 1)) * half);
   }
 
   function median(values) {
@@ -889,9 +921,11 @@
     }
 
     readRetention() {
-      const saved = parseFloat(storeGet(STORAGE.buffer));
-      const minutes = Number.isFinite(saved) && saved > 0 ? saved : LIVE_BUFFER_DEFAULT / 60;
-      return clamp(minutes * 60, 120, 3600);
+      const saved = storeGet(STORAGE.buffer);
+      if (saved === LIVE_BUFFER_UNLIMITED) return Infinity;
+      const minutes = parseFloat(saved);
+      const parsed = Number.isFinite(minutes) && minutes > 0 ? minutes : LIVE_BUFFER_DEFAULT / 60;
+      return clamp(parsed * 60, 120, 3600);
     }
 
     async init(savedQuality) {
@@ -1323,8 +1357,9 @@
     }
 
     setRetention(seconds) {
-      this.retention = clamp(seconds, 120, 3600);
-      storeSet(STORAGE.buffer, String(this.retention / 60));
+      const unlimited = !Number.isFinite(seconds);
+      this.retention = unlimited ? Infinity : clamp(seconds, 120, 3600);
+      storeSet(STORAGE.buffer, unlimited ? LIVE_BUFFER_UNLIMITED : String(this.retention / 60));
       this.evict();
     }
 
@@ -1685,6 +1720,7 @@
       this.destroyed = false;
       this.generation = 0;
       this.wantPlay = true;
+      this.rate = 1;
       this.liveIntent = true;
       this.busySeeding = false;
       this.currentStream = 0;
@@ -1715,7 +1751,7 @@
     async start() {
       if (!window.__tdvrMux || !window.__tdvrMux.mp4) throw new AppError('MUX');
 
-      const savedQuality = storeGet(STORAGE.quality);
+      const savedQuality = this.app.qualityFallback || storeGet(STORAGE.quality);
       let session = new VodSession(this.login);
       let fallbackReason = null;
       try {
@@ -1772,6 +1808,7 @@
 
       this.startTimers();
       this.startLoop();
+      this.showControls();
     }
 
     mount() {
@@ -1809,6 +1846,7 @@
             </div>
           </div>
           <div class="tdvr-time"><span class="tdvr-time-current">0:00</span><span class="tdvr-time-total"> / 0:00</span></div>
+          <span class="tdvr-rate-badge" hidden></span>
           <div class="tdvr-seek">
             <div class="tdvr-seek-track">
               <div class="tdvr-seek-buffer"></div>
@@ -1828,6 +1866,13 @@
           <div class="tdvr-menu-title">Настройки</div>
           <button type="button" class="tdvr-menu-item tdvr-native-item">Стандартный плеер Twitch</button>
           <button type="button" class="tdvr-menu-item tdvr-restart-item">Перезапустить DVR</button>
+          <div class="tdvr-menu-sep"></div>
+          <div class="tdvr-menu-title">Скорость</div>
+          <div class="tdvr-rate-row">
+            <input class="tdvr-rate-range" type="range" min="0" max="${RATE_SLIDER_MAX}" step="1" value="${RATE_SLIDER_MAX / 2}" aria-label="Скорость воспроизведения">
+            <span class="tdvr-rate-value">1x</span>
+          </div>
+          <div class="tdvr-menu-note tdvr-rate-note"></div>
           <div class="tdvr-menu-sep"></div>
           <div class="tdvr-menu-note tdvr-mode-note"></div>
           <div class="tdvr-menu-note tdvr-hint-note"></div>
@@ -1882,6 +1927,10 @@
       this.bufferSetting = root.querySelector('.tdvr-buffer-setting');
       this.bufferOptions = root.querySelector('.tdvr-buffer-options');
       this.bufferUsage = root.querySelector('.tdvr-buffer-usage');
+      this.rateRange = root.querySelector('.tdvr-rate-range');
+      this.rateValue = root.querySelector('.tdvr-rate-value');
+      this.rateNote = root.querySelector('.tdvr-rate-note');
+      this.rateBadge = root.querySelector('.tdvr-rate-badge');
       this.unmuteBtn = root.querySelector('.tdvr-unmute');
       this.toastEl = root.querySelector('.tdvr-toast');
       this.configureModeUi();
@@ -1948,15 +1997,86 @@
         });
         this.bufferOptions.appendChild(button);
       }
+      const unlimited = document.createElement('button');
+      unlimited.type = 'button';
+      unlimited.className = 'tdvr-buffer-option tdvr-buffer-unlimited';
+      unlimited.textContent = 'Без ограничений';
+      unlimited.classList.toggle('tdvr-selected', !Number.isFinite(this.session.retention));
+      unlimited.addEventListener('click', (event) => {
+        event.stopPropagation();
+        this.session.setRetention(Infinity);
+        this.buildBufferOptions();
+        this.updateBufferUi();
+        this.showToast('Локальный буфер без ограничений: он растёт, пока открыта вкладка.', 7000);
+      });
+      this.bufferOptions.appendChild(unlimited);
       this.updateBufferUi();
     }
 
     updateBufferUi() {
       if (!this.bufferUsage || this.session.kind !== 'live') return;
       const used = Math.max(0, Math.round((this.session.bytesStored || 0) / (1024 * 1024)));
-      this.bufferUsage.textContent = this.session.dbFailed
-        ? `Сохранено ~${used} МБ в памяти: браузерный буфер недоступен.`
-        : `Сохранено ~${used} МБ. Старые фрагменты удаляются автоматически.`;
+      if (this.session.dbFailed) {
+        this.bufferUsage.textContent = `Сохранено ~${used} МБ в памяти: браузерный буфер недоступен.`;
+        return;
+      }
+      this.bufferUsage.textContent = Number.isFinite(this.session.retention)
+        ? `Сохранено ~${used} МБ. Старые фрагменты удаляются автоматически.`
+        : `Сохранено ~${used} МБ. Ограничения нет: за длинный эфир буфер может занять десятки гигабайт на диске.`;
+    }
+
+    syncRateUi() {
+      if (this.rateRange) {
+        this.rateRange.value = String(sliderFromRate(this.rate));
+        this.rateRange.setAttribute('aria-valuetext', formatRate(this.rate));
+      }
+      if (this.rateValue) this.rateValue.textContent = formatRate(this.rate);
+      if (this.rateNote) {
+        this.rateNote.textContent = 'Ускорение работает, пока есть отставание от эфира; при догоне скорость само возвращается к 1x.';
+      }
+      this.updateRateBadge();
+    }
+
+    setRate(rate, { announce = false } = {}) {
+      const next = clamp(Number.isFinite(rate) ? rate : 1, RATE_MIN, RATE_MAX);
+      this.rate = next;
+      if (this.video) {
+        // A re-seed reloads the element and resets playbackRate; defaultPlaybackRate
+        // is what it resets to, so the chosen speed survives seeks.
+        this.video.defaultPlaybackRate = next;
+        this.video.playbackRate = next;
+      }
+      this.syncRateUi();
+      if (announce) {
+        this.showToast(next > 1
+          ? `Скорость ${formatRate(next)} — догонит эфир и вернётся к 1x`
+          : `Скорость ${formatRate(next)}`);
+      }
+    }
+
+    updateRateBadge() {
+      if (!this.rateBadge) return;
+      const active = this.rate !== 1;
+      this.rateBadge.hidden = !active;
+      if (active) this.rateBadge.textContent = formatRate(this.rate);
+    }
+
+    // Fast-forward is only allowed over content that already exists. Two things count
+    // as "caught up": reaching the newest point of the timeline, and outrunning what
+    // the engine has appended so far — at 3x the playhead hits the buffered end long
+    // before session.end, and the element just stalls there.
+    releaseRateAtLiveEdge(behind) {
+      if (this.rate <= 1) return;
+      if (behind > RATE_CATCH_UP_SECONDS && !this.nearBufferedEnd()) return;
+      this.setRate(1);
+      if (this.wantPlay && this.video.paused && !this.busySeeding) this.safePlay();
+      this.showToast('Эфир догнан — скорость снова 1x');
+    }
+
+    nearBufferedEnd() {
+      const buffered = this.video.buffered;
+      if (!buffered.length) return false;
+      return buffered.end(buffered.length - 1) - this.video.currentTime <= 1.5;
     }
 
     captureNativeState() {
@@ -2182,8 +2302,17 @@
         event.stopPropagation();
         this.qualityMenu.hidden = true;
         this.settingsMenu.hidden = !this.settingsMenu.hidden;
-        if (!this.settingsMenu.hidden) this.updateBufferUi();
+        if (!this.settingsMenu.hidden) {
+          this.updateBufferUi();
+          this.syncRateUi();
+        }
         this.showControls();
+      });
+      this.rateRange.addEventListener('input', () => {
+        this.setRate(rateFromSlider(parseFloat(this.rateRange.value)));
+      });
+      this.rateRange.addEventListener('change', () => {
+        this.setRate(rateFromSlider(parseFloat(this.rateRange.value)), { announce: true });
       });
       this.fullscreenBtn.addEventListener('click', () => this.toggleFullscreen());
 
@@ -2607,6 +2736,7 @@
       const currentAbs = this.currentStreamTime();
       const current = clamp(currentAbs - start, 0, span);
       const behind = end - currentAbs;
+      this.releaseRateAtLiveEdge(behind);
       if (session.kind === 'live') session.protectFrom = currentAbs - 45;
       if (!session.endlist && behind <= LIVE_INTENT_SECONDS) this.liveIntent = true;
       const atLive = this.liveIntent && behind <= LIVE_WINDOW_SECONDS && !session.endlist;
@@ -2810,6 +2940,26 @@
       title.textContent = 'Качество';
       this.qualityMenu.appendChild(title);
 
+      const auto = document.createElement('button');
+      auto.type = 'button';
+      auto.className = 'tdvr-menu-item';
+      auto.classList.toggle('tdvr-selected', !storeGet(STORAGE.quality));
+      const autoLabel = document.createElement('span');
+      autoLabel.textContent = 'Авто (максимум)';
+      auto.appendChild(autoLabel);
+      const autoCheck = document.createElement('span');
+      autoCheck.className = 'tdvr-menu-check';
+      autoCheck.textContent = '✓';
+      auto.appendChild(autoCheck);
+      auto.addEventListener('click', () => {
+        this.qualityMenu.hidden = true;
+        storeRemove(STORAGE.quality);
+        this.app.qualityFallback = null;
+        this.app.toast('Качество: автоматически, по максимуму.');
+        this.buildQualityMenu();
+      });
+      this.qualityMenu.appendChild(auto);
+
       for (const variant of this.session.variants) {
         const item = document.createElement('button');
         item.type = 'button';
@@ -2847,6 +2997,7 @@
 
     async changeQuality(variant) {
       if (!variant || variant === this.quality || this.destroyed) return;
+      this.app.qualityFallback = null;
       if (this.session.kind === 'live') {
         storeSet(STORAGE.quality, variant.label);
         this.app.toast(`Качество: ${variant.label}. Локальный буфер начнётся заново.`);
@@ -2946,7 +3097,7 @@
         if (!this.video.paused && !this.dragging && this.qualityMenu.hidden && this.settingsMenu.hidden) {
           this.root.classList.add('tdvr-idle');
         }
-      }, 2500);
+      }, IDLE_HIDE_MS);
     }
 
     clearIdleTimer() {
@@ -3038,6 +3189,13 @@
       this.enableTimer = null;
       this.readyCandidate = null;
       this.readySince = 0;
+      this.qualityFallback = null;
+      // Up to 1.3.7 every automatic quality downgrade was written to storage, so a run
+      // of APPEND errors left the channel pinned to the lowest variant. Clear it once.
+      if (storeGet(STORAGE.qualityReset) !== '1') {
+        storeRemove(STORAGE.quality);
+        storeSet(STORAGE.qualityReset, '1');
+      }
       cleanupLiveStorage();
       setInterval(() => cleanupLiveStorage(), 5 * 60 * 1000);
       setInterval(() => this.tick(), 800);
@@ -3146,6 +3304,7 @@
         this.retryAt = 0;
         this.startAttempts = 0;
         this.failedCode = null;
+        this.qualityFallback = null;
         clearTimeout(this.enableTimer);
         this.enableTimer = null;
         if (this.fab) this.fab.hidden = true;
@@ -3160,7 +3319,7 @@
         this.enableTimer = null;
         if (nextQuality && this.startAttempts < 3) {
           this.startAttempts += 1;
-          storeSet(STORAGE.quality, nextQuality);
+          this.qualityFallback = nextQuality;
           this.failedLogin = login;
           this.retryAt = Date.now() + 1500;
           this.toast(`Ошибка воспроизведения (${code}). Пробую качество ${nextQuality}…`);

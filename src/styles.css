@@ -181,6 +181,23 @@
   transform: translateY(4px);
 }
 
+#tdvr-root .tdvr-rate-badge {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  height: 24px;
+  padding: 0 7px;
+  border: 1px solid var(--tdvr-border-strong);
+  border-radius: 7px;
+  background: var(--tdvr-surface-2);
+  color: var(--tdvr-text);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.4px;
+  font-variant-numeric: tabular-nums;
+  pointer-events: none;
+}
+
 #tdvr-root .tdvr-btn {
   flex: 0 0 auto;
   height: 34px;
@@ -624,6 +641,64 @@
   padding: 2px 10px 8px;
 }
 
+#tdvr-root .tdvr-buffer-unlimited {
+  flex: 1 1 100%;
+}
+
+#tdvr-root .tdvr-rate-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 2px 10px 0;
+}
+
+#tdvr-root .tdvr-rate-range {
+  flex: 1 1 auto;
+  width: 100%;
+  height: 18px;
+  margin: 0;
+  appearance: none;
+  background: transparent;
+  cursor: pointer;
+}
+
+#tdvr-root .tdvr-rate-range::-webkit-slider-runnable-track {
+  height: 4px;
+  border-radius: 2px;
+  background: var(--tdvr-track);
+}
+
+#tdvr-root .tdvr-rate-range::-webkit-slider-thumb {
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  margin-top: -5px;
+  border: 0;
+  border-radius: 50%;
+  background: var(--tdvr-accent-strong);
+  transition: background 0.16s var(--tdvr-ease);
+}
+
+#tdvr-root .tdvr-rate-range:hover::-webkit-slider-thumb {
+  background: #ffffff;
+}
+
+#tdvr-root .tdvr-rate-range:focus-visible {
+  outline: 2px solid var(--tdvr-accent);
+  outline-offset: 6px;
+  border-radius: 4px;
+}
+
+#tdvr-root .tdvr-rate-value {
+  flex: 0 0 auto;
+  min-width: 44px;
+  color: var(--tdvr-text);
+  font-size: 11px;
+  font-weight: 700;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
 #tdvr-root .tdvr-buffer-option {
   flex: 1 1 calc(50% - 6px);
   height: 30px;
@@ -854,7 +929,9 @@
 }
 
 #tdvr-root .tdvr-controls {
-  animation: tdvr-dock-in 0.38s var(--tdvr-ease-out) both;
+  /* fill-mode must not be "both": a finished animation outranks normal declarations
+     in the cascade, which kept .tdvr-idle from ever fading the dock out. */
+  animation: tdvr-dock-in 0.38s var(--tdvr-ease-out) backwards;
   transition: opacity 0.3s var(--tdvr-ease), transform 0.3s var(--tdvr-ease);
 }
 

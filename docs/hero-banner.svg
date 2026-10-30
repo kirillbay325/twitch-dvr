@@ -16,7 +16,7 @@
 
   <text x="72" y="86" fill="#8fb0cc" font-family="Segoe UI, Arial, sans-serif" font-size="13" font-weight="700" letter-spacing="3">TWITCH DVR PLAYER</text>
   <text x="72" y="150" fill="#e8edf3" font-family="Segoe UI, Arial, sans-serif" font-size="44" font-weight="700" letter-spacing="-1">Прямой эфир. Полный контроль.</text>
-  <text x="72" y="184" fill="#9aa4b2" font-family="Segoe UI, Arial, sans-serif" font-size="18">Пауза, перемотка и source-качество без перехода на VOD-страницу.</text>
+  <text x="72" y="184" fill="#9aa4b2" font-family="Segoe UI, Arial, sans-serif" font-size="18">Пауза, перемотка и source-качество. Даже если VOD у стримера отключён.</text>
 
   <g font-family="Segoe UI, Arial, sans-serif" font-size="12" font-weight="600">
     <rect x="72" y="212" width="128" height="30" rx="8" fill="#171b21" stroke="#2f3540"/>
@@ -30,6 +30,9 @@
 
     <rect x="516" y="212" width="116" height="30" rx="8" fill="#171b21" stroke="#2f3540"/>
     <text x="532" y="232" fill="#9aa4b2">без прокси</text>
+
+    <rect x="642" y="212" width="132" height="30" rx="8" fill="#171b21" stroke="#2f3540"/>
+    <text x="658" y="232" fill="#b2cee3">live-буфер</text>
   </g>
 
   <g>

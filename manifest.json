@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Twitch DVR Player",
-  "version": "1.2.1",
-  "description": "Перемотка прямого эфира Twitch, пауза и максимальное качество (source из записи текущей трансляции).",
+  "version": "1.3.0",
+  "description": "Перемотка прямого эфира Twitch, пауза, source из записи трансляции и локальный live-буфер, если VOD отключён.",
   "icons": {
     "48": "icons/icon48.png",
     "128": "icons/icon128.png"

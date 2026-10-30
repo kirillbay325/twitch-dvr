@@ -16,13 +16,14 @@
   }
   ensureStyles();
 
-  const VERSION = '1.2.1';
+  const VERSION = '1.3.0';
   const CLIENT_ID = 'kimne78kx3ncx6brgo4mv6wki5h1ko';
   const GQL_URL = 'https://gql.twitch.tv/gql';
   const STORAGE = {
     enabled: 'tdvr:enabled',
     quality: 'tdvr:quality',
     volume: 'tdvr:volume',
+    buffer: 'tdvr:buffer',
   };
   const CHANNEL_SKIP = new Set([
     'directory', 'search', 'videos', 'settings', 'subscriptions', 'inventory', 'wallet',
@@ -38,6 +39,18 @@
   const UI_TICK_MS = 250;
   const LIVE_WINDOW_SECONDS = 30;
   const LIVE_INTENT_SECONDS = 12;
+  const LIVE_BUFFER_OPTIONS = [5, 10, 20, 30];
+  const LIVE_BUFFER_DEFAULT = 600;
+  const LIVE_CACHE_SECONDS = 90;
+  const LIVE_EVICT_CHUNK_SECONDS = 120;
+  const LIVE_PAUSE_EXTRA_SECONDS = 180;
+  const LIVE_PLAYLIST_MIN_MS = 1200;
+  const LIVE_CAPTURE_CONCURRENCY = 3;
+  const LIVE_DB_NAME = 'tdvr-live';
+  const LIVE_DB_STORE = 'segments';
+  const LIVE_DB_VERSION = 1;
+  const LIVE_SESSIONS_KEY = 'tdvr:liveSessions';
+  const LIVE_HEARTBEAT_TTL_MS = 5 * 60 * 1000;
 
   const PLAY_ICON = '<svg width="16" height="18" viewBox="0 0 16 18" fill="none"><path d="M1 1.6v14.8c0 .8.9 1.3 1.6.9l12-7.4a1 1 0 0 0 0-1.8l-12-7.4A1.06 1.06 0 0 0 1 1.6Z" fill="currentColor"/></svg>';
   const PAUSE_ICON = '<svg width="16" height="18" viewBox="0 0 16 18" fill="none"><rect x="1" y="1" width="4.5" height="16" rx="1" fill="currentColor"/><rect x="10.5" y="1" width="4.5" height="16" rx="1" fill="currentColor"/></svg>';
@@ -145,6 +158,10 @@
         return 'Запись канала доступна только подписчикам — DVR недоступен без входа. Включён стандартный плеер.';
       case 'NETWORK':
         return 'Не удалось загрузить DVR из-за сети. Включён стандартный плеер.';
+      case 'LIVE_UNAVAILABLE':
+        return 'Не удалось запустить локальный live-буфер. Включён стандартный плеер.';
+      case 'LIVE_PLAYLIST':
+        return 'Live-поток не отдаёт плейлист. Включён стандартный плеер.';
       case 'STREAM_OFFLINE':
         return null;
       default:
@@ -384,6 +401,245 @@
     return { segments, end: start, endlist, pattern };
   }
 
+  function parseLiveMedia(text, playlistUrl) {
+    const lines = text.split('\n');
+    const segments = [];
+    let endlist = false;
+    let targetDuration = 2;
+    let discontinuity = false;
+    let adStart = 0;
+    let adEnd = 0;
+    let currentDate = null;
+
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i].trim();
+      if (!line) continue;
+      if (line === '#EXT-X-ENDLIST') {
+        endlist = true;
+        continue;
+      }
+      if (line.startsWith('#EXT-X-TARGETDURATION:')) {
+        const parsed = parseFloat(line.slice('#EXT-X-TARGETDURATION:'.length));
+        if (Number.isFinite(parsed) && parsed > 0) targetDuration = parsed;
+        continue;
+      }
+      if (line.startsWith('#EXT-X-DATERANGE:')) {
+        const attrs = parseAttributes(line.slice('#EXT-X-DATERANGE:'.length));
+        if (attrs.CLASS === 'twitch-stitched-ad' && attrs['START-DATE']) {
+          const start = Date.parse(attrs['START-DATE']);
+          const seconds = parseFloat(attrs.DURATION || attrs['X-TV-TWITCH-AD-POD-FILLED-DURATION'] || '30');
+          if (Number.isFinite(start)) {
+            const end = start + (Number.isFinite(seconds) && seconds > 0 ? seconds * 1000 : 30000);
+            if (end > adEnd) {
+              adStart = start;
+              adEnd = end;
+            }
+          }
+        }
+        continue;
+      }
+      if (line.startsWith('#EXT-X-PROGRAM-DATE-TIME:')) {
+        const parsed = Date.parse(line.slice('#EXT-X-PROGRAM-DATE-TIME:'.length));
+        if (Number.isFinite(parsed)) currentDate = parsed;
+        continue;
+      }
+      if (line === '#EXT-X-DISCONTINUITY') {
+        discontinuity = true;
+        continue;
+      }
+      if (!line.startsWith('#EXTINF:')) continue;
+
+      const duration = parseFloat(line.slice('#EXTINF:'.length).split(',')[0]);
+      const comma = line.indexOf(',');
+      const title = comma >= 0 ? line.slice(comma + 1) : '';
+      const uri = (lines[i + 1] || '').trim();
+      if (!uri || uri.startsWith('#')) continue;
+      i += 1;
+
+      let url;
+      try {
+        url = new URL(uri, playlistUrl).href;
+      } catch {
+        continue;
+      }
+      const dur = Number.isFinite(duration) && duration > 0 ? duration : targetDuration;
+      const adByTitle = /(^|[,|\s])amazon\|/i.test(title) || /\b(stitched[-_ ]?ad|advert)\b/i.test(title);
+      const adByDate = currentDate !== null && adEnd > adStart && currentDate >= adStart - 500 && currentDate < adEnd - 250;
+      segments.push({ url, dur, disc: discontinuity, ad: adByTitle || adByDate });
+      discontinuity = false;
+    }
+
+    return { segments, endlist, targetDuration };
+  }
+
+  function liveUrlKey(url) {
+    try { return new URL(url).pathname; } catch { return url; }
+  }
+
+  function liveDbPut(db, key, value) {
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(LIVE_DB_STORE, 'readwrite');
+      tx.objectStore(LIVE_DB_STORE).put(value, key);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error || new Error('IDB abort'));
+    });
+  }
+
+  function liveDbGet(db, key) {
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(LIVE_DB_STORE, 'readonly');
+      const request = tx.objectStore(LIVE_DB_STORE).get(key);
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    });
+  }
+
+  function liveDbDeleteKeys(db, keys) {
+    return new Promise((resolve, reject) => {
+      if (!keys.length) { resolve(); return; }
+      const tx = db.transaction(LIVE_DB_STORE, 'readwrite');
+      const store = tx.objectStore(LIVE_DB_STORE);
+      for (const key of keys) store.delete(key);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error || new Error('IDB abort'));
+    });
+  }
+
+  function liveDbDeleteSession(db, sessionId) {
+    return new Promise((resolve) => {
+      const tx = db.transaction(LIVE_DB_STORE, 'readwrite');
+      const store = tx.objectStore(LIVE_DB_STORE);
+      const index = store.index('session');
+      const request = index.openCursor(IDBKeyRange.only(sessionId));
+      request.onsuccess = () => {
+        const cursor = request.result;
+        if (cursor) {
+          cursor.delete();
+          cursor.continue();
+        }
+      };
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => resolve();
+      tx.onabort = () => resolve();
+    });
+  }
+
+  function liveDbPurgeOld(db) {
+    const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+    return new Promise((resolve) => {
+      const tx = db.transaction(LIVE_DB_STORE, 'readwrite');
+      const index = tx.objectStore(LIVE_DB_STORE).index('created');
+      const request = index.openCursor(IDBKeyRange.upperBound(cutoff));
+      request.onsuccess = () => {
+        const cursor = request.result;
+        if (cursor) {
+          cursor.delete();
+          cursor.continue();
+        }
+      };
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => resolve();
+      tx.onabort = () => resolve();
+    });
+  }
+
+  function liveSessionMap() {
+    try {
+      const raw = localStorage.getItem(LIVE_SESSIONS_KEY);
+      if (!raw) return {};
+      const parsed = JSON.parse(raw);
+      if (!parsed || typeof parsed !== 'object') return {};
+      const now = Date.now();
+      for (const [id, at] of Object.entries(parsed)) {
+        if (!Number.isFinite(at) || now - at > LIVE_HEARTBEAT_TTL_MS) delete parsed[id];
+      }
+      return parsed;
+    } catch {
+      return {};
+    }
+  }
+
+  function touchLiveSession(id) {
+    const map = liveSessionMap();
+    map[id] = Date.now();
+    try { localStorage.setItem(LIVE_SESSIONS_KEY, JSON.stringify(map)); } catch { /* ignored */ }
+  }
+
+  function dropLiveSession(id) {
+    const map = liveSessionMap();
+    delete map[id];
+    try { localStorage.setItem(LIVE_SESSIONS_KEY, JSON.stringify(map)); } catch { /* ignored */ }
+  }
+
+  function liveDbSessionIds(db) {
+    return new Promise((resolve) => {
+      const ids = new Set();
+      const tx = db.transaction(LIVE_DB_STORE, 'readonly');
+      const index = tx.objectStore(LIVE_DB_STORE).index('session');
+      const request = index.openKeyCursor(null, 'nextunique');
+      request.onsuccess = () => {
+        const cursor = request.result;
+        if (cursor) {
+          ids.add(cursor.key);
+          cursor.continue();
+        }
+      };
+      tx.oncomplete = () => resolve([...ids]);
+      tx.onerror = () => resolve([...ids]);
+      tx.onabort = () => resolve([...ids]);
+    });
+  }
+
+  let liveCleanupRunning = false;
+
+  function cleanupLiveStorage() {
+    if (liveCleanupRunning) return Promise.resolve();
+    liveCleanupRunning = true;
+    return (async () => {
+      if (typeof indexedDB === 'undefined') return;
+      const db = await new Promise((resolve) => {
+        let request;
+        try {
+          request = indexedDB.open(LIVE_DB_NAME, LIVE_DB_VERSION);
+        } catch {
+          resolve(null);
+          return;
+        }
+        request.onupgradeneeded = () => {
+          const opened = request.result;
+          if (!opened.objectStoreNames.contains(LIVE_DB_STORE)) {
+            const store = opened.createObjectStore(LIVE_DB_STORE);
+            store.createIndex('session', 'sessionId', { unique: false });
+            store.createIndex('created', 'createdAt', { unique: false });
+          }
+        };
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => resolve(null);
+        request.onblocked = () => resolve(null);
+        setTimeout(() => resolve(null), 4000);
+      });
+      if (!db) return;
+
+      try {
+        const active = liveSessionMap();
+        try { localStorage.setItem(LIVE_SESSIONS_KEY, JSON.stringify(active)); } catch { /* ignored */ }
+        const ids = await liveDbSessionIds(db);
+        for (const id of ids) {
+          if (active[id]) continue;
+          await liveDbDeleteSession(db, id);
+        }
+      } finally {
+        try { db.close(); } catch { /* ignored */ }
+      }
+    })()
+      .catch(() => { /* ignored */ })
+      .finally(() => {
+        liveCleanupRunning = false;
+      });
+  }
+
   class VodSession {
     constructor(login) {
       this.login = login;
@@ -527,6 +783,490 @@
     }
   }
 
+  class LiveSession {
+    constructor(login) {
+      this.kind = 'live';
+      this.login = login;
+      this.sessionId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+      this.lastHeartbeatAt = Date.now();
+      touchLiveSession(this.sessionId);
+      this.masterUrl = '';
+      this.variants = [];
+      this.variant = null;
+      this.segments = [];
+      this.byKey = new Map();
+      this.seen = new Set();
+      this.end = 0;
+      this.start = 0;
+      this.endlist = false;
+      this.adBreak = false;
+      this.segmentDur = 2;
+      this.playlistUrl = '';
+      this.lastPlaylistAt = 0;
+      this.loadingPlaylist = null;
+      this.capturePromise = null;
+      this.destroyed = false;
+      this.memory = new Map();
+      this.memoryBytes = 0;
+      this.pending = new Map();
+      this.db = null;
+      this.dbPromise = null;
+      this.dbFailed = false;
+      this.retention = this.readRetention();
+      this.captureFailures = 0;
+      this.protectFrom = Infinity;
+      this.bytesStored = 0;
+      this.onEnded = null;
+    }
+
+    readRetention() {
+      const saved = parseFloat(storeGet(STORAGE.buffer));
+      const minutes = Number.isFinite(saved) && saved > 0 ? saved : LIVE_BUFFER_DEFAULT / 60;
+      return clamp(minutes * 60, 120, 3600);
+    }
+
+    async init(savedQuality) {
+      const stream = await fetchLiveStream(this.login);
+      if (!stream) throw new AppError('STREAM_OFFLINE');
+
+      let token;
+      try {
+        token = await fetchPlaybackToken(this.login, '');
+      } catch (error) {
+        throw error.code === 'NETWORK' ? error : new AppError('STREAM_OFFLINE', error);
+      }
+
+      this.masterUrl = `https://usher.ttvnw.net/api/channel/hls/${encodeURIComponent(this.login)}.m3u8?allow_source=true&allow_audio_only=true&fast_bread=true&playlist_include_framerate=true&reassignments_supported=true&sig=${encodeURIComponent(token.signature)}&token=${encodeURIComponent(token.value)}`;
+
+      let response;
+      try {
+        response = await fetchWithRetry(this.masterUrl, { cache: 'no-store' }, 2, 15000);
+      } catch (error) {
+        throw new AppError('NETWORK', error);
+      }
+      if (!response.ok) throw new AppError('LIVE_UNAVAILABLE');
+
+      const master = await response.text();
+      this.variants = parseMaster(master, this.masterUrl).filter((variant) => !variant.audioOnly);
+      if (!this.variants.length) throw new AppError('LIVE_UNAVAILABLE');
+
+      this.selectQuality(savedQuality);
+      await this.loadPlaylist(true).catch(() => { /* retried below */ });
+
+      const started = Date.now();
+      let failures = 0;
+      while (!this.destroyed && !this.endlist
+        && (this.adBreak || !this.segments.length)
+        && Date.now() - started < 120000
+        && failures < 5) {
+        await sleep(1500);
+        try {
+          await this.loadPlaylist(true);
+          failures = 0;
+        } catch {
+          failures += 1;
+        }
+      }
+      if (!this.segments.length || (this.adBreak && !this.endlist)) throw new AppError('LIVE_UNAVAILABLE');
+
+      this.ensureDb()
+        .then((db) => (db ? liveDbPurgeOld(db) : null))
+        .catch(() => { /* ignored */ });
+    }
+
+    selectQuality(savedQuality) {
+      let index = -1;
+      if (savedQuality) index = this.variants.findIndex((variant) => variant.label === savedQuality);
+      this.variant = index >= 0 ? this.variants[index] : this.variants[0];
+    }
+
+    async loadPlaylist(force = false) {
+      if (this.destroyed || this.endlist) return 0;
+      if (this.loadingPlaylist) return this.loadingPlaylist;
+      if (!force && Date.now() - this.lastPlaylistAt < LIVE_PLAYLIST_MIN_MS) return 0;
+
+      this.loadingPlaylist = (async () => {
+        let response;
+        try {
+          response = await fetchWithRetry(this.variant.url, { cache: 'no-store' }, 2, 15000);
+        } catch (error) {
+          throw new AppError('LIVE_PLAYLIST', error);
+        }
+        if (!response.ok) throw new AppError('LIVE_PLAYLIST');
+
+        const text = await response.text();
+        const parsed = parseLiveMedia(text, this.variant.url);
+        if (!parsed.segments.length) throw new AppError('LIVE_PLAYLIST');
+
+        let latest = this.segments[this.segments.length - 1];
+        let added = 0;
+        for (const item of parsed.segments) {
+          if (item.ad) continue;
+          const key = liveUrlKey(item.url);
+          const existing = this.byKey.get(key);
+          if (existing) {
+            existing.url = item.url;
+            continue;
+          }
+          if (this.seen.has(key)) continue;
+
+          const start = latest ? latest.start + latest.dur : 0;
+          const segment = {
+            key,
+            start,
+            dur: item.dur,
+            url: item.url,
+            disc: item.disc,
+            available: false,
+            bytes: 0,
+          };
+          this.segments.push(segment);
+          this.byKey.set(key, segment);
+          this.seen.add(key);
+          latest = segment;
+          added += 1;
+        }
+
+        if (this.segments.length) {
+          const last = this.segments[this.segments.length - 1];
+          this.end = last.start + last.dur;
+          this.start = this.segments[0].start;
+        }
+        const durations = parsed.segments.map((segment) => segment.dur);
+        this.segmentDur = median(durations) || this.segmentDur;
+        const lastParsed = parsed.segments[parsed.segments.length - 1];
+        this.adBreak = !!(lastParsed && lastParsed.ad);
+        this.lastPlaylistAt = Date.now();
+
+        if (parsed.endlist) {
+          this.endlist = true;
+          if (this.onEnded) this.onEnded();
+        }
+        return added;
+      })().finally(() => {
+        this.loadingPlaylist = null;
+      });
+      return this.loadingPlaylist;
+    }
+
+    playlistAge() {
+      return Date.now() - this.lastPlaylistAt;
+    }
+
+    segmentIndexAt(time) {
+      const segments = this.segments;
+      if (!segments.length) return -1;
+      let low = 0;
+      let high = segments.length - 1;
+      let answer = 0;
+      while (low <= high) {
+        const mid = (low + high) >> 1;
+        if (segments[mid].start <= time) {
+          answer = mid;
+          low = mid + 1;
+        } else {
+          high = mid - 1;
+        }
+      }
+      return answer;
+    }
+
+    urlForIndex(index) {
+      const segment = this.segments[index];
+      return segment ? segment.url : null;
+    }
+
+    startCapture() {
+      if (this.capturePromise || this.destroyed || this.endlist) return;
+      this.capturePromise = this.captureLoop()
+        .catch(() => { /* handled inside */ })
+        .finally(() => {
+          this.capturePromise = null;
+        });
+    }
+
+    async captureLoop() {
+      while (!this.destroyed && !this.endlist) {
+        if (Date.now() - this.lastHeartbeatAt > 10000) {
+          this.lastHeartbeatAt = Date.now();
+          touchLiveSession(this.sessionId);
+        }
+        try {
+          await this.loadPlaylist(true);
+          await this.captureNewSegments();
+          this.captureFailures = 0;
+        } catch (error) {
+          if (this.destroyed || this.endlist) break;
+          this.captureFailures += 1;
+          if (this.captureFailures >= 6) {
+            const alive = await this.checkStreamAlive();
+            if (!alive && !this.destroyed) {
+              this.endlist = true;
+              if (this.onEnded) this.onEnded();
+              break;
+            }
+          }
+        }
+        if (this.destroyed || this.endlist) break;
+        await sleep(this.captureDelay());
+      }
+    }
+
+    captureDelay() {
+      return clamp((this.segmentDur || 2) * 750, 1200, 3500);
+    }
+
+    async captureNewSegments() {
+      const waiting = this.segments.filter((segment) => !segment.available && !this.pending.has(segment.key));
+      let failures = 0;
+      for (let i = 0; i < waiting.length; i += LIVE_CAPTURE_CONCURRENCY) {
+        if (this.destroyed) return;
+        const batch = waiting.slice(i, i + LIVE_CAPTURE_CONCURRENCY);
+        const results = await Promise.all(batch.map((segment) => this.loadSegment(segment).catch(() => null)));
+        failures += results.filter((result) => !result).length;
+        this.evict();
+      }
+      if (waiting.length && failures === waiting.length) throw new AppError('LIVE_PLAYLIST');
+    }
+
+    async checkStreamAlive() {
+      try {
+        const stream = await fetchLiveStream(this.login);
+        return !!stream;
+      } catch {
+        return true;
+      }
+    }
+
+    async loadSegment(segment) {
+      const cached = this.memory.get(segment.key);
+      if (cached) return cached.bytes;
+      if (this.pending.has(segment.key)) return this.pending.get(segment.key);
+
+      const task = (async () => {
+        if (segment.available) {
+          const stored = await this.readStored(segment.key);
+          if (stored) {
+            this.remember(segment, stored);
+            return stored;
+          }
+          segment.available = false;
+        }
+
+        let lastError;
+        for (let attempt = 0; attempt < 2; attempt++) {
+          try {
+            const response = await fetchWithRetry(segment.url, { cache: 'no-store' }, 2, 20000);
+            if (response.status === 404 || response.status === 403) throw new AppError('EXPIRED');
+            if (!response.ok) throw new AppError('NETWORK');
+            const bytes = await response.arrayBuffer();
+            await this.storeSegment(segment, bytes);
+            return bytes;
+          } catch (error) {
+            lastError = error;
+            if (error instanceof AppError && error.code === 'EXPIRED') throw error;
+            if (attempt === 0) await sleep(600);
+          }
+        }
+        throw lastError || new AppError('NETWORK');
+      })().finally(() => {
+        this.pending.delete(segment.key);
+      });
+
+      this.pending.set(segment.key, task);
+      return task;
+    }
+
+    async getSegmentBytes(index) {
+      const segment = this.segments[index];
+      if (!segment) throw new AppError('NOT_READY');
+      return this.loadSegment(segment);
+    }
+
+    remember(segment, bytes) {
+      const existing = this.memory.get(segment.key);
+      if (!existing) this.memoryBytes += bytes.byteLength;
+      this.memory.set(segment.key, { bytes, start: segment.start, size: bytes.byteLength });
+      this.pruneMemory();
+    }
+
+    pruneMemory() {
+      const windowSeconds = this.dbFailed ? this.retention : LIVE_CACHE_SECONDS;
+      const oldest = this.end - windowSeconds;
+      for (const [key, entry] of this.memory) {
+        if (entry.start < oldest) {
+          this.memory.delete(key);
+          this.memoryBytes = Math.max(0, this.memoryBytes - entry.size);
+        }
+      }
+      const maxBytes = this.dbFailed ? 384 * 1024 * 1024 : 128 * 1024 * 1024;
+      while (this.memoryBytes > maxBytes && this.memory.size) {
+        const [key, entry] = this.memory.entries().next().value;
+        this.memory.delete(key);
+        this.memoryBytes = Math.max(0, this.memoryBytes - entry.size);
+      }
+    }
+
+    async storeSegment(segment, bytes) {
+      if (this.destroyed) return;
+      segment.available = true;
+      if (!segment.bytes) {
+        segment.bytes = bytes.byteLength;
+        this.bytesStored += bytes.byteLength;
+      }
+      this.remember(segment, bytes);
+      if (this.dbFailed) return;
+
+      try {
+        const db = await this.ensureDb();
+        if (!db) return;
+        await liveDbPut(db, `${this.sessionId}:${segment.key}`, {
+          sessionId: this.sessionId,
+          key: segment.key,
+          start: segment.start,
+          dur: segment.dur,
+          data: bytes,
+          createdAt: Date.now(),
+        });
+      } catch (error) {
+        this.dbFailed = true;
+        console.warn('[TwitchDVR] live buffer storage failed', error);
+      }
+    }
+
+    async readStored(key) {
+      if (this.dbFailed) return null;
+      try {
+        const db = await this.ensureDb();
+        if (!db) return null;
+        const record = await liveDbGet(db, `${this.sessionId}:${key}`);
+        if (!record || !record.data) return null;
+        if (record.data instanceof Blob) return await record.data.arrayBuffer();
+        return record.data;
+      } catch {
+        return null;
+      }
+    }
+
+    ensureDb() {
+      if (this.db) return Promise.resolve(this.db);
+      if (this.dbPromise) return this.dbPromise;
+      if (typeof indexedDB === 'undefined') {
+        this.dbFailed = true;
+        return Promise.resolve(null);
+      }
+
+      this.dbPromise = new Promise((resolve) => {
+        let settled = false;
+        const finish = (db) => {
+          if (settled) return;
+          settled = true;
+          resolve(db);
+        };
+        const timer = setTimeout(() => {
+          this.dbFailed = true;
+          finish(null);
+        }, 4000);
+
+        let request;
+        try {
+          request = indexedDB.open(LIVE_DB_NAME, LIVE_DB_VERSION);
+        } catch {
+          clearTimeout(timer);
+          this.dbFailed = true;
+          finish(null);
+          return;
+        }
+
+        request.onupgradeneeded = () => {
+          const db = request.result;
+          if (!db.objectStoreNames.contains(LIVE_DB_STORE)) {
+            const store = db.createObjectStore(LIVE_DB_STORE);
+            store.createIndex('session', 'sessionId', { unique: false });
+            store.createIndex('created', 'createdAt', { unique: false });
+          }
+        };
+        request.onsuccess = () => {
+          clearTimeout(timer);
+          this.db = request.result;
+          finish(this.db);
+        };
+        request.onerror = () => {
+          clearTimeout(timer);
+          this.dbFailed = true;
+          finish(null);
+        };
+        request.onblocked = () => {
+          this.dbFailed = true;
+        };
+      });
+      return this.dbPromise;
+    }
+
+    evict() {
+      if (!this.segments.length) {
+        this.start = this.end;
+        return;
+      }
+      let cutoff = this.end - this.retention;
+      if (Number.isFinite(this.protectFrom)) {
+        cutoff = Math.min(cutoff, this.protectFrom - 45);
+      }
+      const hardCutoff = this.end - this.retention - LIVE_PAUSE_EXTRA_SECONDS;
+      if (cutoff < hardCutoff) cutoff = hardCutoff;
+      if (cutoff - this.segments[0].start < LIVE_EVICT_CHUNK_SECONDS) return;
+
+      const deleted = [];
+      while (this.segments.length && this.segments[0].start + this.segments[0].dur <= cutoff) {
+        const segment = this.segments.shift();
+        this.byKey.delete(segment.key);
+        const cached = this.memory.get(segment.key);
+        if (cached) {
+          this.memory.delete(segment.key);
+          this.memoryBytes = Math.max(0, this.memoryBytes - cached.size);
+        }
+        if (segment.bytes) this.bytesStored = Math.max(0, this.bytesStored - segment.bytes);
+        deleted.push(segment.key);
+      }
+      if (this.segments.length) this.start = this.segments[0].start;
+      if (deleted.length) this.deleteStored(deleted);
+    }
+
+    async deleteStored(keys) {
+      if (!keys.length || this.dbFailed) return;
+      try {
+        const db = await this.ensureDb();
+        if (!db) return;
+        await liveDbDeleteKeys(db, keys.map((key) => `${this.sessionId}:${key}`));
+      } catch { /* ignored */ }
+    }
+
+    setRetention(seconds) {
+      this.retention = clamp(seconds, 120, 3600);
+      storeSet(STORAGE.buffer, String(this.retention / 60));
+      this.evict();
+    }
+
+    destroy() {
+      if (this.destroyed) return;
+      this.destroyed = true;
+      this.endlist = true;
+      dropLiveSession(this.sessionId);
+      this.pending.clear();
+      this.memory.clear();
+      this.memoryBytes = 0;
+      const dbPromise = this.db ? Promise.resolve(this.db) : this.ensureDb();
+      dbPromise
+        .then((db) => {
+          if (!db) return null;
+          return liveDbDeleteSession(db, this.sessionId).finally(() => {
+            try { db.close(); } catch { /* ignored */ }
+          });
+        })
+        .catch(() => { /* ignored */ });
+    }
+  }
+
   class MseEngine {
     constructor(video) {
       this.video = video;
@@ -541,6 +1281,7 @@
       this.generation = 0;
       this.onUpdate = null;
       this.lastError = null;
+      this.absoluteTimeline = false;
     }
 
     async reset(codecs) {
@@ -646,6 +1387,9 @@
       if (!this.transmuxer) return;
       if (this.offset === null && this.firstSegmentStart === null) this.firstSegmentStart = segmentStart;
       try {
+        if (this.absoluteTimeline) {
+          this.transmuxer.setBaseMediaDecodeTime(Math.max(0, Math.round(segmentStart * 90000)));
+        }
         this.transmuxer.push(new Uint8Array(bytes));
         this.transmuxer.flush();
       } catch (error) {
@@ -791,17 +1535,41 @@
       this.geometryKey = null;
       this.lastVolume = 0.5;
       this.lastVolumeLevel = null;
+      this.adBreakSeen = false;
+      this.lastBufferStatsAt = 0;
     }
 
     async start() {
       if (!window.__tdvrMux || !window.__tdvrMux.mp4) throw new AppError('MUX');
-      this.session = new VodSession(this.login);
-      await this.session.init(storeGet(STORAGE.quality));
-      if (this.destroyed) return;
+
+      const savedQuality = storeGet(STORAGE.quality);
+      let session = new VodSession(this.login);
+      let fallbackReason = null;
+      try {
+        await session.init(savedQuality);
+      } catch (error) {
+        const code = error && error.code;
+        if (code !== 'NO_VOD' && code !== 'VOD_SUB_ONLY' && code !== 'VOD_UNAVAILABLE') throw error;
+        fallbackReason = code;
+        session = new LiveSession(this.login);
+        try {
+          await session.init(savedQuality);
+        } catch (liveError) {
+          session.destroy();
+          throw liveError;
+        }
+      }
+      this.session = session;
+      this.fallbackReason = fallbackReason;
+      if (this.destroyed) {
+        if (session.destroy) session.destroy();
+        return;
+      }
 
       this.mount();
       this.engine = new MseEngine(this.video);
       this.engine.onUpdate = () => this.handleEngineUpdate();
+      this.engine.absoluteTimeline = this.session.kind === 'live';
       this.quality = this.session.variant;
       this.applyVolume();
       this.buildQualityMenu();
@@ -809,10 +1577,27 @@
       this.bindControls();
 
       const latestIndex = this.session.segments.length - 1;
-      if (latestIndex < 0) throw new AppError('VOD_UNAVAILABLE');
+      if (latestIndex < 0) throw new AppError(this.session.kind === 'live' ? 'LIVE_UNAVAILABLE' : 'VOD_UNAVAILABLE');
       const latest = this.session.segments[latestIndex];
       this.liveIntent = true;
       await this.seed(latestIndex, latest.start);
+
+      if (this.session.kind === 'live') {
+        this.session.onEnded = () => {
+          if (this.destroyed) return;
+          this.endedToastShown = true;
+          this.updateUi();
+          this.showToast('Трансляция завершилась. Сохранённый буфер доступен для перемотки.', 8000);
+        };
+        this.session.startCapture();
+        this.showToast(
+          fallbackReason === 'VOD_SUB_ONLY'
+            ? 'Запись только для подписчиков. Включён локальный live-буфер: перемотка с момента входа, качество эфира.'
+            : 'VOD недоступен. Включён локальный live-буфер: перемотка с момента входа, качество эфира.',
+          9000,
+        );
+      }
+
       this.startTimers();
       this.startLoop();
     }
@@ -871,8 +1656,13 @@
           <button type="button" class="tdvr-menu-item tdvr-native-item">Стандартный плеер Twitch</button>
           <button type="button" class="tdvr-menu-item tdvr-restart-item">Перезапустить DVR</button>
           <div class="tdvr-menu-sep"></div>
-          <div class="tdvr-menu-note">DVR играет запись текущего эфира: задержка ~15–30 с. Зато доступно source-качество и перемотка на любой момент трансляции.</div>
-          <div class="tdvr-menu-note">Если видео подтормаживает, выберите качество ниже.</div>
+          <div class="tdvr-menu-note tdvr-mode-note"></div>
+          <div class="tdvr-menu-note tdvr-hint-note"></div>
+          <div class="tdvr-buffer-setting" hidden>
+            <div class="tdvr-menu-title">Размер буфера</div>
+            <div class="tdvr-buffer-options"></div>
+            <div class="tdvr-menu-note tdvr-buffer-usage"></div>
+          </div>
           <div class="tdvr-menu-note">Версия ${VERSION}</div>
         </div>
         <div class="tdvr-toast" hidden></div>
@@ -914,8 +1704,14 @@
       this.fullscreenBtn = root.querySelector('.tdvr-fullscreen-btn');
       this.qualityMenu = root.querySelector('.tdvr-quality-menu');
       this.settingsMenu = root.querySelector('.tdvr-settings-menu');
+      this.modeNote = root.querySelector('.tdvr-mode-note');
+      this.hintNote = root.querySelector('.tdvr-hint-note');
+      this.bufferSetting = root.querySelector('.tdvr-buffer-setting');
+      this.bufferOptions = root.querySelector('.tdvr-buffer-options');
+      this.bufferUsage = root.querySelector('.tdvr-buffer-usage');
       this.unmuteBtn = root.querySelector('.tdvr-unmute');
       this.toastEl = root.querySelector('.tdvr-toast');
+      this.configureModeUi();
 
       Object.assign(this.video.style, {
         position: 'absolute',
@@ -941,6 +1737,53 @@
       this.captureNativeState();
       this.guardNative();
       this.guardTimer = setInterval(() => this.guardNative(), 800);
+    }
+
+    configureModeUi() {
+      const live = this.session.kind === 'live';
+      this.root.classList.toggle('tdvr-mode-live', live);
+      this.root.dataset.mode = live ? 'live' : 'vod';
+      if (this.seekBuffer) this.seekBuffer.classList.toggle('tdvr-stored', live);
+      if (live) {
+        this.modeNote.textContent = 'Локальный live-буфер: история начинается с момента открытия канала. Качество — то, что отдаёт эфир (в РФ часто 720p).';
+        this.hintNote.textContent = 'Пока вкладка открыта, эфир сохраняется в буфер. Рекламные вставки Twitch пропускаются; во время рекламы плеер ждёт продолжения.';
+        this.bufferSetting.hidden = false;
+        this.buildBufferOptions();
+      } else {
+        this.modeNote.textContent = 'DVR играет запись текущего эфира: задержка ~15–30 с. Зато доступно source-качество и перемотка на любой момент трансляции.';
+        this.hintNote.textContent = 'Если видео подтормаживает, выберите качество ниже.';
+        this.bufferSetting.hidden = true;
+      }
+    }
+
+    buildBufferOptions() {
+      if (!this.bufferOptions) return;
+      this.bufferOptions.innerHTML = '';
+      const current = Math.round(this.session.retention / 60);
+      for (const minutes of LIVE_BUFFER_OPTIONS) {
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'tdvr-buffer-option';
+        button.textContent = `${minutes} мин`;
+        button.classList.toggle('tdvr-selected', minutes === current);
+        button.addEventListener('click', (event) => {
+          event.stopPropagation();
+          this.session.setRetention(minutes * 60);
+          this.buildBufferOptions();
+          this.updateBufferUi();
+          this.showToast(`Локальный буфер: ${minutes} мин.`);
+        });
+        this.bufferOptions.appendChild(button);
+      }
+      this.updateBufferUi();
+    }
+
+    updateBufferUi() {
+      if (!this.bufferUsage || this.session.kind !== 'live') return;
+      const used = Math.max(0, Math.round((this.session.bytesStored || 0) / (1024 * 1024)));
+      this.bufferUsage.textContent = this.session.dbFailed
+        ? `Сохранено ~${used} МБ в памяти: браузерный буфер недоступен.`
+        : `Сохранено ~${used} МБ. Старые фрагменты удаляются автоматически.`;
     }
 
     captureNativeState() {
@@ -1116,6 +1959,13 @@
         this.syncGeometry();
       };
       window.addEventListener('resize', this.onWindowResize);
+      this.onPageHide = (event) => {
+        if (event && event.persisted) return;
+        if (this.session && this.session.destroy) {
+          try { this.session.destroy(); } catch { /* ignored */ }
+        }
+      };
+      window.addEventListener('pagehide', this.onPageHide);
       this.video.addEventListener('volumechange', this.onVolumeChange);
       this.video.addEventListener('playing', this.onPlaying);
       this.video.addEventListener('pause', this.onPause);
@@ -1159,6 +2009,7 @@
         event.stopPropagation();
         this.qualityMenu.hidden = true;
         this.settingsMenu.hidden = !this.settingsMenu.hidden;
+        if (!this.settingsMenu.hidden) this.updateBufferUi();
         this.showControls();
       });
       this.fullscreenBtn.addEventListener('click', () => this.toggleFullscreen());
@@ -1194,16 +2045,23 @@
     }
 
     bindSeek() {
+      const timeline = () => {
+        const start = this.session ? (this.session.start || 0) : 0;
+        const end = this.session ? this.session.end : 0;
+        return { start, end, span: Math.max(end - start, 1) };
+      };
       const timeFromEvent = (event) => {
         const rect = this.seek.getBoundingClientRect();
         const ratio = clamp((event.clientX - rect.left) / Math.max(1, rect.width), 0, 1);
-        return ratio * Math.max(1, this.duration);
+        const { start, span } = timeline();
+        return start + ratio * span;
       };
       const setPreview = (time) => {
-        const ratio = this.duration ? clamp(time / this.duration, 0, 1) : 0;
+        const { start, end, span } = timeline();
+        const ratio = clamp((time - start) / span, 0, 1);
         this.seekPlayed.style.width = `${ratio * 100}%`;
         this.seekHandle.style.left = `${ratio * 100}%`;
-        this.seekTooltip.textContent = time >= this.duration - 1 ? 'LIVE' : formatTime(time);
+        this.seekTooltip.textContent = time >= end - 1 ? 'LIVE' : formatTime(time - start);
         const rect = this.seek.getBoundingClientRect();
         const tooltipX = clamp(ratio * rect.width, 36, rect.width - 36);
         this.seekTooltip.style.left = `${tooltipX}px`;
@@ -1221,7 +2079,7 @@
         document.removeEventListener('pointerup', onUp);
         const target = timeFromEvent(event);
         this.dragTime = target;
-        if (target >= this.duration - 1) {
+        if (target >= this.session.end - 1) {
           this.goLive(true);
         } else {
           this.seekTo(target, { autoplay: this.wantPlay });
@@ -1267,7 +2125,7 @@
         await this.engine.reset(this.quality.codecs);
         if (this.destroyed || generation !== this.generation) return;
 
-        const bytes = await this.fetchSegmentWithRetry(segment.url, generation);
+        const bytes = await this.fetchSessionSegment(index, generation);
         if (this.destroyed || generation !== this.generation) return;
 
         this.engine.pushTs(bytes, segment.start);
@@ -1299,6 +2157,15 @@
           this.updateUi();
         }
       }
+    }
+
+    async fetchSessionSegment(index, generation) {
+      const segment = this.session.segments[index];
+      if (!segment) throw new AppError('NOT_READY');
+      if (this.session.kind === 'live') {
+        return await this.session.getSegmentBytes(index);
+      }
+      return await this.fetchSegmentWithRetry(segment.url, generation);
     }
 
     async fetchSegmentWithRetry(url, generation) {
@@ -1409,7 +2276,7 @@
           const generation = this.generation;
           let bytes;
           try {
-            bytes = await this.fetchSegment(url, generation);
+            bytes = await this.fetchSessionSegment(index, generation);
           } catch (error) {
             if (this.destroyed || generation !== this.generation) continue;
             if (error.code === 'NOT_READY') {
@@ -1417,6 +2284,11 @@
               continue;
             }
             if (error.code === 'STALE') continue;
+            if (error.code === 'EXPIRED') {
+              this.showToast('Фрагмент уже ушёл из live-плейлиста. Догоняю эфир…');
+              await this.goLive(true);
+              continue;
+            }
             this.networkErrors += 1;
             if (this.networkErrors === 3) this.showToast('Проблемы с сетью. Пробую снова…');
             await sleep(NETWORK_RETRY_MS);
@@ -1427,8 +2299,13 @@
 
           let segment = this.session.segments[index];
           if (!segment) {
+            if (this.session.kind === 'live') continue;
             segment = this.session.addProbedSegment(index, url);
             if (!segment) continue;
+          }
+          if (this.session.kind === 'live' && segment.disc && this.engine.bufferedStreamRange()) {
+            await this.seed(index, segment.start);
+            continue;
           }
           if (buffered.end >= segment.start + segment.dur - 0.2) {
             continue;
@@ -1447,7 +2324,7 @@
       if (this.playlistRefreshing) return;
       this.playlistRefreshing = true;
       try {
-        await this.session.loadPlaylist(true);
+        await this.session.loadPlaylist(this.session.kind !== 'live');
         this.duration = this.session.end;
       } catch { /* ignored */ } finally {
         this.playlistRefreshing = false;
@@ -1548,41 +2425,73 @@
     updateUi() {
       if (this.destroyed || !this.session) return;
       const session = this.session;
-      this.duration = Math.max(session.end, 1);
-      const current = clamp(this.currentStreamTime(), 0, this.duration);
-      const behind = this.duration - current;
+      const start = session.start || 0;
+      const end = session.end;
+      const span = Math.max(end - start, 1);
+      this.duration = Math.max(end, 1);
+      const currentAbs = this.currentStreamTime();
+      const current = clamp(currentAbs - start, 0, span);
+      const behind = end - currentAbs;
+      if (session.kind === 'live') session.protectFrom = currentAbs - 45;
       if (!session.endlist && behind <= LIVE_INTENT_SECONDS) this.liveIntent = true;
       const atLive = this.liveIntent && behind <= LIVE_WINDOW_SECONDS && !session.endlist;
 
+      if (this.root) this.root.dataset.ad = session.kind === 'live' && session.adBreak ? '1' : '0';
+      if (session.kind === 'live') {
+        if (session.adBreak && !this.adBreakSeen) {
+          this.adBreakSeen = true;
+          this.showToast('На Twitch идёт реклама. Локальный DVR продолжит после неё.', 7000);
+        } else if (!session.adBreak) {
+          this.adBreakSeen = false;
+        }
+        if (this.settingsMenu && !this.settingsMenu.hidden && Date.now() - this.lastBufferStatsAt > 2000) {
+          this.lastBufferStatsAt = Date.now();
+          this.updateBufferUi();
+        }
+      }
+
       if (!this.dragging) {
-        const ratio = current / this.duration;
+        const ratio = current / span;
         this.seekPlayed.style.width = `${ratio * 100}%`;
         this.seekHandle.style.left = `${ratio * 100}%`;
-        const buffered = this.engine.bufferedStreamRange();
-        if (buffered) {
-          const start = clamp(buffered.start / this.duration, 0, 1);
-          const end = clamp(buffered.end / this.duration, 0, 1);
-          this.seekBuffer.style.left = `${start * 100}%`;
-          this.seekBuffer.style.width = `${Math.max(0, end - start) * 100}%`;
+        if (session.kind === 'live') {
+          this.seekBuffer.style.left = '0%';
+          this.seekBuffer.style.width = '100%';
         } else {
-          this.seekBuffer.style.width = '0%';
+          const buffered = this.engine.bufferedStreamRange();
+          if (buffered) {
+            const bufferStart = clamp((buffered.start - start) / span, 0, 1);
+            const bufferEnd = clamp((buffered.end - start) / span, 0, 1);
+            this.seekBuffer.style.left = `${bufferStart * 100}%`;
+            this.seekBuffer.style.width = `${Math.max(0, bufferEnd - bufferStart) * 100}%`;
+          } else {
+            this.seekBuffer.style.width = '0%';
+          }
         }
       }
 
       this.timeCurrent.textContent = formatTime(current);
-      this.timeTotal.textContent = ` / ${formatTime(this.duration)}`;
+      this.timeTotal.textContent = ` / ${formatTime(span)}`;
 
       this.liveBtn.classList.toggle('tdvr-behind', !atLive);
       if (session.endlist) {
         this.liveLabel.textContent = 'ЗАВЕРШЕНО';
         this.liveBtn.classList.add('tdvr-behind');
         this.liveBtn.title = 'Трансляция завершилась';
+      } else if (session.kind === 'live' && session.adBreak && this.stalled) {
+        this.liveLabel.textContent = 'РЕКЛАМА';
+        this.liveBtn.classList.add('tdvr-behind');
+        this.liveBtn.title = 'На Twitch идёт реклама. DVR продолжит после неё';
       } else if (atLive) {
         this.liveLabel.textContent = 'LIVE';
-        this.liveBtn.title = 'Прямой эфир (DVR-задержка ~15–30 с)';
+        this.liveBtn.title = session.kind === 'live'
+          ? 'Прямой эфир (локальный буфер)'
+          : 'Прямой эфир (DVR-задержка ~15–30 с)';
       } else {
         this.liveLabel.textContent = 'К ЭФИРУ';
-        this.liveBtn.title = 'Перейти к последнему моменту эфира';
+        this.liveBtn.title = session.kind === 'live'
+          ? 'Перейти к последнему сохранённому моменту'
+          : 'Перейти к последнему моменту эфира';
       }
 
       if (this.quality) this.qualityBtn.textContent = this.quality.label;
@@ -1654,7 +2563,8 @@
       }
       const duration = this.session.end;
       if (!duration) return;
-      let target = clamp(time, 0, duration - 0.05);
+      const start = this.session.start || 0;
+      let target = clamp(time, start, duration - 0.05);
       if (target >= duration - 1.5) {
         await this.goLive(true);
         return;
@@ -1679,7 +2589,12 @@
       try {
         await this.seed(index, target);
       } catch (error) {
-        if (!this.destroyed) this.fail(error);
+        if (this.destroyed) return;
+        if (error && (error.code === 'EXPIRED' || error.code === 'NOT_READY')) {
+          this.showToast('Этот момент уже вне локального буфера.');
+          return;
+        }
+        this.fail(error);
       }
     }
 
@@ -1749,12 +2664,21 @@
 
       const note = document.createElement('div');
       note.className = 'tdvr-menu-note';
-      note.textContent = 'Лучшее доступное качество выбрано автоматически. В РФ live-плеер Twitch урезан до 720p, а запись отдаёт source.';
+      note.textContent = this.session.kind === 'live'
+        ? 'В live-режиме доступно качество эфира, в РФ обычно 720p. Переключение качества начнёт локальный буфер заново.'
+        : 'Лучшее доступное качество выбрано автоматически. В РФ live-плеер Twitch урезан до 720p, а запись отдаёт source.';
       this.qualityMenu.appendChild(note);
     }
 
     async changeQuality(variant) {
       if (!variant || variant === this.quality || this.destroyed) return;
+      if (this.session.kind === 'live') {
+        storeSet(STORAGE.quality, variant.label);
+        this.app.toast(`Качество: ${variant.label}. Локальный буфер начнётся заново.`);
+        this.app.restart();
+        return;
+      }
+
       const wasPlaying = this.wantPlay;
       const time = this.currentStreamTime();
       const previous = this.quality;
@@ -1894,6 +2818,10 @@
       if (this.onVisibility) document.removeEventListener('visibilitychange', this.onVisibility);
       if (this.onFullscreenChange) document.removeEventListener('fullscreenchange', this.onFullscreenChange);
       if (this.onWindowResize) window.removeEventListener('resize', this.onWindowResize);
+      if (this.onPageHide) window.removeEventListener('pagehide', this.onPageHide);
+      if (this.session && this.session.destroy) {
+        try { this.session.destroy(); } catch { /* ignored */ }
+      }
       try { this.engine && this.engine.destroy(); } catch { /* ignored */ }
       if (this.video) {
         try { this.video.pause(); } catch { /* ignored */ }
@@ -1927,6 +2855,8 @@
       this.startAttempts = 0;
       this.readyCandidate = null;
       this.readySince = 0;
+      cleanupLiveStorage();
+      setInterval(() => cleanupLiveStorage(), 5 * 60 * 1000);
       setInterval(() => this.tick(), 800);
       try {
         const notice = sessionStorage.getItem('tdvr:notice');

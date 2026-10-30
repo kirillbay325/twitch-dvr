@@ -16,7 +16,7 @@
   }
   ensureStyles();
 
-  const VERSION = '1.3.0';
+  const VERSION = '1.3.1';
   const CLIENT_ID = 'kimne78kx3ncx6brgo4mv6wki5h1ko';
   const GQL_URL = 'https://gql.twitch.tv/gql';
   const STORAGE = {
@@ -24,6 +24,7 @@
     quality: 'tdvr:quality',
     volume: 'tdvr:volume',
     buffer: 'tdvr:buffer',
+    startMuted: 'tdvr:startMuted',
   };
   const CHANNEL_SKIP = new Set([
     'directory', 'search', 'videos', 'settings', 'subscriptions', 'inventory', 'wallet',
@@ -1655,6 +1656,10 @@
           <div class="tdvr-menu-title">Настройки</div>
           <button type="button" class="tdvr-menu-item tdvr-native-item">Стандартный плеер Twitch</button>
           <button type="button" class="tdvr-menu-item tdvr-restart-item">Перезапустить DVR</button>
+          <button type="button" class="tdvr-menu-item tdvr-startmute-item" role="menuitemcheckbox" aria-checked="true">
+            <span>Запускать без звука</span>
+            <span class="tdvr-menu-check">✓</span>
+          </button>
           <div class="tdvr-menu-sep"></div>
           <div class="tdvr-menu-note tdvr-mode-note"></div>
           <div class="tdvr-menu-note tdvr-hint-note"></div>
@@ -1704,6 +1709,7 @@
       this.fullscreenBtn = root.querySelector('.tdvr-fullscreen-btn');
       this.qualityMenu = root.querySelector('.tdvr-quality-menu');
       this.settingsMenu = root.querySelector('.tdvr-settings-menu');
+      this.startMuteItem = root.querySelector('.tdvr-startmute-item');
       this.modeNote = root.querySelector('.tdvr-mode-note');
       this.hintNote = root.querySelector('.tdvr-hint-note');
       this.bufferSetting = root.querySelector('.tdvr-buffer-setting');
@@ -1876,13 +1882,44 @@
       this.lastVolumeLevel = level;
     }
 
+    startMutedEnabled() {
+      return storeGet(STORAGE.startMuted) !== '0';
+    }
+
+    syncStartMuteUi() {
+      if (!this.startMuteItem) return;
+      const enabled = this.startMutedEnabled();
+      this.startMuteItem.classList.toggle('tdvr-selected', enabled);
+      this.startMuteItem.setAttribute('aria-checked', String(enabled));
+    }
+
+    toggleStartMuted() {
+      const next = !this.startMutedEnabled();
+      storeSet(STORAGE.startMuted, next ? '1' : '0');
+      this.syncStartMuteUi();
+
+      if (next) {
+        if (!this.video.muted && this.video.volume > 0) this.lastVolume = this.video.volume;
+        this.video.muted = true;
+      } else if (this.video.muted) {
+        const restore = clamp(this.lastVolume > 0 ? this.lastVolume : 0.5, 0.01, 1);
+        this.video.volume = restore;
+        this.video.muted = false;
+        storeSet(STORAGE.volume, String(restore));
+        this.hideUnmute();
+      }
+      this.updateVolumeUi();
+      this.updateUi();
+    }
+
     applyVolume() {
       const saved = parseFloat(storeGet(STORAGE.volume));
       const volume = Number.isFinite(saved) ? clamp(saved, 0, 1) : 1;
       this.video.volume = volume;
-      this.video.muted = volume === 0;
+      this.video.muted = this.startMutedEnabled() || volume === 0;
       this.lastVolume = volume > 0 ? volume : 0.5;
       this.updateVolumeUi();
+      this.syncStartMuteUi();
     }
 
     setVolume(volume, persist = true) {
@@ -2020,6 +2057,11 @@
       this.root.querySelector('.tdvr-restart-item').addEventListener('click', () => {
         this.app.restart();
       });
+      this.startMuteItem.addEventListener('click', (event) => {
+        event.stopPropagation();
+        this.toggleStartMuted();
+      });
+      this.syncStartMuteUi();
 
       this.onDocumentClick = (event) => {
         if (this.qualityMenu.hidden && this.settingsMenu.hidden) return;
@@ -2798,8 +2840,13 @@
 
     fail(error) {
       if (this.destroyed) return;
-      console.warn('[TwitchDVR] failure', error);
-      this.app.useNative({ message: 'DVR остановлен из-за ошибки. Включён стандартный плеер.' });
+      const code = error && error.code ? error.code : 'UNKNOWN';
+      console.warn('[TwitchDVR] failure', code, error);
+      this.app.useNative({
+        message: `DVR остановлен из-за ошибки (${code}). Включён стандартный плеер; кнопка DVR попробует снова.`,
+        persist: false,
+        reload: false,
+      });
     }
 
     destroy() {
@@ -2950,6 +2997,7 @@
         this.retryAt = 0;
         this.startAttempts = 0;
         if (this.fab) this.fab.hidden = true;
+        if (this.toastEl) this.toastEl.hidden = true;
       } catch (error) {
         if (player) player.destroy();
         const code = error && error.code ? error.code : 'UNKNOWN';
@@ -2987,7 +3035,19 @@
 
     useNative(options = {}) {
       this.destroyPlayer();
-      storeSet(STORAGE.enabled, '0');
+      if (options.persist !== false) storeSet(STORAGE.enabled, '0');
+      if (options.reload === false) {
+        this.failedLogin = this.login;
+        this.retryAt = 0;
+        if (storeGet(STORAGE.startMuted) !== '0') {
+          try {
+            document.querySelectorAll('.video-player video').forEach((video) => { video.muted = true; });
+          } catch { /* ignored */ }
+        }
+        if (this.container) this.ensureFab();
+        if (options.message) this.toast(options.message);
+        return;
+      }
       try {
         sessionStorage.setItem('tdvr:notice', options.message || 'Включён стандартный плеер Twitch. Кнопка DVR вернёт режим перемотки.');
       } catch { /* ignored */ }
@@ -2996,7 +3056,12 @@
 
     enableDvr() {
       storeSet(STORAGE.enabled, '1');
-      location.reload();
+      this.failedLogin = null;
+      this.retryAt = 0;
+      this.startAttempts = 0;
+      this.loading = false;
+      if (this.toastEl) this.toastEl.hidden = true;
+      this.tick();
     }
 
     destroyPlayer() {

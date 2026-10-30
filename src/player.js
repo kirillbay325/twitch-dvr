@@ -16,7 +16,7 @@
   }
   ensureStyles();
 
-  const VERSION = '1.3.1';
+  const VERSION = '1.3.7';
   const CLIENT_ID = 'kimne78kx3ncx6brgo4mv6wki5h1ko';
   const GQL_URL = 'https://gql.twitch.tv/gql';
   const STORAGE = {
@@ -24,7 +24,6 @@
     quality: 'tdvr:quality',
     volume: 'tdvr:volume',
     buffer: 'tdvr:buffer',
-    startMuted: 'tdvr:startMuted',
   };
   const CHANNEL_SKIP = new Set([
     'directory', 'search', 'videos', 'settings', 'subscriptions', 'inventory', 'wallet',
@@ -154,19 +153,30 @@
   function errorMessage(code) {
     switch (code) {
       case 'NO_VOD':
-        return 'DVR недоступен: у канала нет доступной записи эфира (VOD отключены). Включён стандартный плеер.';
+        return 'У канала нет доступной записи эфира (VOD отключены).';
       case 'VOD_SUB_ONLY':
-        return 'Запись канала доступна только подписчикам — DVR недоступен без входа. Включён стандартный плеер.';
+        return 'Запись канала доступна только подписчикам.';
       case 'NETWORK':
-        return 'Не удалось загрузить DVR из-за сети. Включён стандартный плеер.';
+        return 'DVR не запустился из-за сети. Нажмите DVR, чтобы повторить.';
       case 'LIVE_UNAVAILABLE':
-        return 'Не удалось запустить локальный live-буфер. Включён стандартный плеер.';
+        return 'Не удалось запустить локальный live-буфер. Нажмите DVR, чтобы повторить.';
+      case 'LIVE_SUB_ONLY':
+        return 'Live-поток доступен только подписчикам или после входа в Twitch.';
+      case 'LIVE_ADS_TIMEOUT':
+        return 'Не удалось дождаться контента после рекламы. Попробуйте DVR позже.';
       case 'LIVE_PLAYLIST':
-        return 'Live-поток не отдаёт плейлист. Включён стандартный плеер.';
+        return 'Live-поток не отдаёт плейлист. Попробуйте DVR позже.';
+      case 'INIT':
+        return 'Поток отдаёт фрагменты без инициализирующего сегмента. Попробуйте другое качество.';
+      case 'APPEND':
+      case 'MEDIA':
+      case 'TRANSMUX':
+      case 'CODEC':
+        return 'Плеер отверг медиаданные этого потока. Попробуйте другое качество.';
       case 'STREAM_OFFLINE':
         return null;
       default:
-        return 'DVR не удалось запустить. Включён стандартный плеер.';
+        return 'DVR не удалось запустить.';
     }
   }
 
@@ -293,6 +303,16 @@
     return Math.abs(Date.now() / 1000 - end) <= 900;
   }
 
+  function parseInitMap(line, baseUrl) {
+    const attrs = parseAttributes(line.slice('#EXT-X-MAP:'.length));
+    if (!attrs.URI) return null;
+    try {
+      return new URL(attrs.URI, baseUrl).href;
+    } catch {
+      return null;
+    }
+  }
+
   function parseMaster(text, baseUrl) {
     const lines = text.split('\n').map((line) => line.trim());
     const groups = {};
@@ -354,18 +374,30 @@
     return variants;
   }
 
+  function preferPlayableVariants(variants) {
+    const h264 = variants.filter((variant) => /(avc1|avc3)/i.test(variant.codecs));
+    const avcAac = h264.filter((variant) => /mp4a/i.test(variant.codecs));
+    if (avcAac.length) return avcAac;
+    return h264.length ? h264 : variants;
+  }
+
   function parseMedia(text, playlistUrl) {
     const lines = text.split('\n');
     const segments = [];
     let start = 0;
     let endlist = false;
     let pattern = null;
+    let init = null;
 
     for (let i = 0; i < lines.length; i++) {
       const line = lines[i].trim();
       if (!line) continue;
       if (line === '#EXT-X-ENDLIST') {
         endlist = true;
+        continue;
+      }
+      if (line.startsWith('#EXT-X-MAP:')) {
+        init = parseInitMap(line, playlistUrl) || init;
         continue;
       }
       if (!line.startsWith('#EXTINF:')) continue;
@@ -395,11 +427,11 @@
         }
       }
       const dur = Number.isFinite(duration) && duration > 0 ? duration : 10;
-      segments.push({ start, dur, url });
+      segments.push({ start, dur, url, init });
       start += dur;
     }
 
-    return { segments, end: start, endlist, pattern };
+    return { segments, end: start, endlist, pattern, init };
   }
 
   function parseLiveMedia(text, playlistUrl) {
@@ -411,12 +443,17 @@
     let adStart = 0;
     let adEnd = 0;
     let currentDate = null;
+    let init = null;
 
     for (let i = 0; i < lines.length; i++) {
       const line = lines[i].trim();
       if (!line) continue;
       if (line === '#EXT-X-ENDLIST') {
         endlist = true;
+        continue;
+      }
+      if (line.startsWith('#EXT-X-MAP:')) {
+        init = parseInitMap(line, playlistUrl) || init;
         continue;
       }
       if (line.startsWith('#EXT-X-TARGETDURATION:')) {
@@ -466,11 +503,11 @@
       const dur = Number.isFinite(duration) && duration > 0 ? duration : targetDuration;
       const adByTitle = /(^|[,|\s])amazon\|/i.test(title) || /\b(stitched[-_ ]?ad|advert)\b/i.test(title);
       const adByDate = currentDate !== null && adEnd > adStart && currentDate >= adStart - 500 && currentDate < adEnd - 250;
-      segments.push({ url, dur, disc: discontinuity, ad: adByTitle || adByDate });
+      segments.push({ url, dur, disc: discontinuity, ad: adByTitle || adByDate, init });
       discontinuity = false;
     }
 
-    return { segments, endlist, targetDuration };
+    return { segments, endlist, targetDuration, init };
   }
 
   function liveUrlKey(url) {
@@ -641,6 +678,26 @@
       });
   }
 
+  // CMAF/fMP4 playlists carry track descriptions in a separate init segment (#EXT-X-MAP).
+  // The URI is signed and rotates with every playlist fetch, so it is cached per URL.
+  async function fetchInitBytes(session, index) {
+    const segment = session.segments[index];
+    const url = (segment && segment.init) || session.playlistInit;
+    if (!url) return null;
+    if (session.initCache && session.initCache.url === url) return session.initCache.bytes;
+    try {
+      const response = await fetchWithRetry(url, { cache: 'no-store' }, 2, 15000);
+      if (!response.ok) throw new AppError('NETWORK');
+      const bytes = new Uint8Array(await response.arrayBuffer());
+      if (!bytes.byteLength) throw new AppError('NETWORK');
+      session.initCache = { url, bytes };
+      return bytes;
+    } catch (error) {
+      if (session.initCache) return session.initCache.bytes;
+      throw error;
+    }
+  }
+
   class VodSession {
     constructor(login) {
       this.login = login;
@@ -656,6 +713,8 @@
       this.playlistUrl = '';
       this.lastPlaylistAt = 0;
       this.loadingPlaylist = null;
+      this.playlistInit = null;
+      this.initCache = null;
     }
 
     async init(savedQuality) {
@@ -688,7 +747,7 @@
         throw new AppError(response.status === 403 || response.status === 401 ? 'VOD_SUB_ONLY' : 'VOD_UNAVAILABLE');
       }
       const master = await response.text();
-      this.variants = parseMaster(master, this.masterUrl).filter((variant) => !variant.audioOnly);
+      this.variants = preferPlayableVariants(parseMaster(master, this.masterUrl).filter((variant) => !variant.audioOnly));
       if (!this.variants.length) throw new AppError('VOD_UNAVAILABLE');
 
       this.selectQuality(savedQuality);
@@ -704,6 +763,8 @@
     async setVariant(variant) {
       this.variant = variant;
       this.pattern = null;
+      this.playlistInit = null;
+      this.initCache = null;
       this.lastPlaylistAt = 0;
       await this.loadPlaylist(true);
     }
@@ -729,6 +790,7 @@
         }
         this.segments = merged;
         this.pattern = parsed.pattern || this.pattern;
+        this.playlistInit = parsed.init || this.playlistInit;
         this.endlist = parsed.endlist;
         const last = this.segments[this.segments.length - 1];
         this.end = last.start + last.dur;
@@ -777,10 +839,14 @@
       const previous = this.segments[this.segments.length - 1];
       const start = previous ? previous.start + previous.dur : 0;
       const dur = this.segmentDur || 10;
-      const segment = { start, dur, url };
+      const segment = { start, dur, url, init: this.playlistInit };
       this.segments.push(segment);
       this.end = start + dur;
       return segment;
+    }
+
+    initBytesFor(index) {
+      return fetchInitBytes(this, index);
     }
   }
 
@@ -805,6 +871,8 @@
       this.playlistUrl = '';
       this.lastPlaylistAt = 0;
       this.loadingPlaylist = null;
+      this.playlistInit = null;
+      this.initCache = null;
       this.capturePromise = null;
       this.destroyed = false;
       this.memory = new Map();
@@ -845,10 +913,13 @@
       } catch (error) {
         throw new AppError('NETWORK', error);
       }
-      if (!response.ok) throw new AppError('LIVE_UNAVAILABLE');
+      if (!response.ok) {
+        if (response.status === 401 || response.status === 403) throw new AppError('LIVE_SUB_ONLY');
+        throw new AppError('LIVE_UNAVAILABLE');
+      }
 
       const master = await response.text();
-      this.variants = parseMaster(master, this.masterUrl).filter((variant) => !variant.audioOnly);
+      this.variants = preferPlayableVariants(parseMaster(master, this.masterUrl).filter((variant) => !variant.audioOnly));
       if (!this.variants.length) throw new AppError('LIVE_UNAVAILABLE');
 
       this.selectQuality(savedQuality);
@@ -868,7 +939,9 @@
           failures += 1;
         }
       }
-      if (!this.segments.length || (this.adBreak && !this.endlist)) throw new AppError('LIVE_UNAVAILABLE');
+      if (!this.segments.length || (this.adBreak && !this.endlist)) {
+        throw new AppError(this.adBreak && !this.endlist ? 'LIVE_ADS_TIMEOUT' : 'LIVE_UNAVAILABLE');
+      }
 
       this.ensureDb()
         .then((db) => (db ? liveDbPurgeOld(db) : null))
@@ -898,6 +971,7 @@
         const text = await response.text();
         const parsed = parseLiveMedia(text, this.variant.url);
         if (!parsed.segments.length) throw new AppError('LIVE_PLAYLIST');
+        this.playlistInit = parsed.init || this.playlistInit;
 
         let latest = this.segments[this.segments.length - 1];
         let added = 0;
@@ -907,6 +981,7 @@
           const existing = this.byKey.get(key);
           if (existing) {
             existing.url = item.url;
+            existing.init = item.init || existing.init;
             continue;
           }
           if (this.seen.has(key)) continue;
@@ -918,6 +993,7 @@
             dur: item.dur,
             url: item.url,
             disc: item.disc,
+            init: item.init || null,
             available: false,
             bytes: 0,
           };
@@ -1082,6 +1158,10 @@
       const segment = this.segments[index];
       if (!segment) throw new AppError('NOT_READY');
       return this.loadSegment(segment);
+    }
+
+    initBytesFor(index) {
+      return fetchInitBytes(this, index);
     }
 
     remember(segment, bytes) {
@@ -1282,7 +1362,9 @@
       this.generation = 0;
       this.onUpdate = null;
       this.lastError = null;
-      this.absoluteTimeline = false;
+      this.container = null;
+      this.lastInit = null;
+      this.containerWarned = false;
     }
 
     async reset(codecs) {
@@ -1292,6 +1374,9 @@
       this.firstOutput = true;
       this.firstSegmentStart = null;
       this.lastError = null;
+      this.container = null;
+      this.lastInit = null;
+      this.containerWarned = false;
 
       if (this.sourceBuffer) {
         try { this.sourceBuffer.abort(); } catch { /* ignored */ }
@@ -1306,6 +1391,7 @@
       this.sourceBuffer = null;
 
       const mime = `video/mp4; codecs="${String(codecs).replace(/"/g, '')}"`;
+      this.mime = mime;
       if (typeof MediaSource === 'undefined' || !MediaSource.isTypeSupported(mime)) {
         throw new AppError('CODEC');
       }
@@ -1370,6 +1456,10 @@
       this.transmuxer = new window.__tdvrMux.mp4.Transmuxer();
       this.transmuxer.on('data', (segment) => {
         let data = segment.data;
+        // mux.js emits empty payloads for segments without samples (ID3-only Twitch
+        // metasegments, stitched-ad filler). Appending one detaches the SourceBuffer,
+        // so the init segment stays queued until real samples arrive with it.
+        if (!data || !data.byteLength) return;
         if (this.firstOutput) {
           if (segment.initSegment && segment.initSegment.byteLength) {
             const merged = new Uint8Array(segment.initSegment.byteLength + data.byteLength);
@@ -1384,14 +1474,82 @@
       });
     }
 
-    pushTs(bytes, segmentStart) {
-      if (!this.transmuxer) return;
-      if (this.offset === null && this.firstSegmentStart === null) this.firstSegmentStart = segmentStart;
-      try {
-        if (this.absoluteTimeline) {
-          this.transmuxer.setBaseMediaDecodeTime(Math.max(0, Math.round(segmentStart * 90000)));
+    detectContainer(bytes) {
+      if (!bytes || !bytes.byteLength) return 'empty';
+      if (bytes[0] === 0x47 && (bytes.byteLength < 188 * 2 || bytes[188] === 0x47)) return 'ts';
+      const box = String.fromCharCode(bytes[4], bytes[5], bytes[6], bytes[7]);
+      if (/^(styp|moof|sidx|emsg|ftyp|moov|mdat|free|skip|uuid)$/.test(box)) return 'mp4';
+      return 'unknown';
+    }
+
+    pushSegment(bytes, segmentStart, initBytes) {
+      if (this.lastError) return;
+      const view = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+      const container = this.detectContainer(view);
+      if (container === 'unknown' || container === 'empty') {
+        if (!this.containerWarned) {
+          this.containerWarned = true;
+          console.warn('[TwitchDVR] segment has no known container', {
+            container,
+            bytes: view.byteLength,
+            head: [...view.subarray(0, Math.min(8, view.byteLength))],
+            mime: this.mime,
+            mediaSource: this.mediaSource && this.mediaSource.readyState,
+            videoConnected: this.video.isConnected,
+          });
         }
-        this.transmuxer.push(new Uint8Array(bytes));
+        return;
+      }
+      this.container = container;
+      if (this.offset === null && this.firstSegmentStart === null) this.firstSegmentStart = segmentStart;
+      if (container === 'mp4') {
+        this.pushMp4(view, initBytes);
+        return;
+      }
+      this.pushTs(view);
+    }
+
+    pushMp4(bytes, initBytes) {
+      if (!this.sourceBuffer) return;
+      let chunk = bytes;
+      const carriesInit = this.firstBoxType(bytes, 'moov');
+      if (!carriesInit && (this.firstOutput || (initBytes && initBytes !== this.lastInit))) {
+        if (!initBytes || !initBytes.byteLength) {
+          if (!this.containerWarned) {
+            this.containerWarned = true;
+            console.warn('[TwitchDVR] CMAF segment without init segment', { mime: this.mime });
+          }
+          this.lastError = new AppError('INIT');
+          return;
+        }
+        const merged = new Uint8Array(initBytes.byteLength + bytes.byteLength);
+        merged.set(initBytes, 0);
+        merged.set(bytes, initBytes.byteLength);
+        chunk = merged;
+        this.lastInit = initBytes;
+      }
+      this.firstOutput = false;
+      this.queue.push(chunk);
+      this.pumpQueue();
+    }
+
+    firstBoxType(bytes, wanted) {
+      const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+      let offset = 0;
+      for (let i = 0; i < 8 && offset + 8 <= bytes.byteLength; i++) {
+        const size = dv.getUint32(offset);
+        const type = String.fromCharCode(bytes[offset + 4], bytes[offset + 5], bytes[offset + 6], bytes[offset + 7]);
+        if (type === wanted) return true;
+        if (!Number.isFinite(size) || size < 8 || offset + size > bytes.byteLength) return false;
+        offset += size;
+      }
+      return false;
+    }
+
+    pushTs(bytes) {
+      if (!this.transmuxer) return;
+      try {
+        this.transmuxer.push(bytes);
         this.transmuxer.flush();
       } catch (error) {
         this.lastError = new AppError('TRANSMUX', error);
@@ -1399,11 +1557,25 @@
     }
 
     pumpQueue() {
-      if (!this.sourceBuffer || this.sourceBuffer.updating || !this.queue.length) return;
+      if (this.lastError) return;
+      if (!this.sourceBuffer || this.sourceBuffer.updating) return;
+      while (this.queue.length && !this.queue[0]) this.queue.shift();
+      if (!this.queue.length) return;
       const chunk = this.queue.shift();
       try {
         this.sourceBuffer.appendBuffer(chunk);
       } catch (error) {
+        console.warn('[TwitchDVR] appendBuffer failed', {
+          name: error && error.name,
+          message: error && error.message,
+          container: this.container,
+          chunkBytes: chunk && chunk.byteLength,
+          mime: this.mime,
+          mediaSource: this.mediaSource && this.mediaSource.readyState,
+          sourceBufferMode: this.sourceBuffer && this.sourceBuffer.mode,
+          videoConnected: this.video.isConnected,
+          videoReadyState: this.video.readyState,
+        });
         this.lastError = new AppError('APPEND', error);
       }
     }
@@ -1550,7 +1722,7 @@
         await session.init(savedQuality);
       } catch (error) {
         const code = error && error.code;
-        if (code !== 'NO_VOD' && code !== 'VOD_SUB_ONLY' && code !== 'VOD_UNAVAILABLE') throw error;
+        if (code !== 'NO_VOD' && code !== 'VOD_SUB_ONLY' && code !== 'VOD_UNAVAILABLE' && code !== 'PLAYLIST') throw error;
         fallbackReason = code;
         session = new LiveSession(this.login);
         try {
@@ -1570,7 +1742,6 @@
       this.mount();
       this.engine = new MseEngine(this.video);
       this.engine.onUpdate = () => this.handleEngineUpdate();
-      this.engine.absoluteTimeline = this.session.kind === 'live';
       this.quality = this.session.variant;
       this.applyVolume();
       this.buildQualityMenu();
@@ -1627,6 +1798,7 @@
         </div>
         <div class="tdvr-controls">
           <button type="button" class="tdvr-btn tdvr-playpause" title="Пауза">${PAUSE_ICON}</button>
+          <span class="tdvr-dvr-badge" aria-hidden="true">DVR</span>
           <div class="tdvr-volume">
             <button type="button" class="tdvr-btn tdvr-mute" title="Выключить звук" aria-label="Выключить звук" aria-pressed="false">${volumeIcon('high')}</button>
             <div class="tdvr-volume-slider">
@@ -1656,10 +1828,6 @@
           <div class="tdvr-menu-title">Настройки</div>
           <button type="button" class="tdvr-menu-item tdvr-native-item">Стандартный плеер Twitch</button>
           <button type="button" class="tdvr-menu-item tdvr-restart-item">Перезапустить DVR</button>
-          <button type="button" class="tdvr-menu-item tdvr-startmute-item" role="menuitemcheckbox" aria-checked="true">
-            <span>Запускать без звука</span>
-            <span class="tdvr-menu-check">✓</span>
-          </button>
           <div class="tdvr-menu-sep"></div>
           <div class="tdvr-menu-note tdvr-mode-note"></div>
           <div class="tdvr-menu-note tdvr-hint-note"></div>
@@ -1709,7 +1877,6 @@
       this.fullscreenBtn = root.querySelector('.tdvr-fullscreen-btn');
       this.qualityMenu = root.querySelector('.tdvr-quality-menu');
       this.settingsMenu = root.querySelector('.tdvr-settings-menu');
-      this.startMuteItem = root.querySelector('.tdvr-startmute-item');
       this.modeNote = root.querySelector('.tdvr-mode-note');
       this.hintNote = root.querySelector('.tdvr-hint-note');
       this.bufferSetting = root.querySelector('.tdvr-buffer-setting');
@@ -1882,44 +2049,13 @@
       this.lastVolumeLevel = level;
     }
 
-    startMutedEnabled() {
-      return storeGet(STORAGE.startMuted) !== '0';
-    }
-
-    syncStartMuteUi() {
-      if (!this.startMuteItem) return;
-      const enabled = this.startMutedEnabled();
-      this.startMuteItem.classList.toggle('tdvr-selected', enabled);
-      this.startMuteItem.setAttribute('aria-checked', String(enabled));
-    }
-
-    toggleStartMuted() {
-      const next = !this.startMutedEnabled();
-      storeSet(STORAGE.startMuted, next ? '1' : '0');
-      this.syncStartMuteUi();
-
-      if (next) {
-        if (!this.video.muted && this.video.volume > 0) this.lastVolume = this.video.volume;
-        this.video.muted = true;
-      } else if (this.video.muted) {
-        const restore = clamp(this.lastVolume > 0 ? this.lastVolume : 0.5, 0.01, 1);
-        this.video.volume = restore;
-        this.video.muted = false;
-        storeSet(STORAGE.volume, String(restore));
-        this.hideUnmute();
-      }
-      this.updateVolumeUi();
-      this.updateUi();
-    }
-
     applyVolume() {
       const saved = parseFloat(storeGet(STORAGE.volume));
       const volume = Number.isFinite(saved) ? clamp(saved, 0, 1) : 1;
       this.video.volume = volume;
-      this.video.muted = this.startMutedEnabled() || volume === 0;
+      this.video.muted = volume === 0;
       this.lastVolume = volume > 0 ? volume : 0.5;
       this.updateVolumeUi();
-      this.syncStartMuteUi();
     }
 
     setVolume(volume, persist = true) {
@@ -2057,11 +2193,6 @@
       this.root.querySelector('.tdvr-restart-item').addEventListener('click', () => {
         this.app.restart();
       });
-      this.startMuteItem.addEventListener('click', (event) => {
-        event.stopPropagation();
-        this.toggleStartMuted();
-      });
-      this.syncStartMuteUi();
 
       this.onDocumentClick = (event) => {
         if (this.qualityMenu.hidden && this.settingsMenu.hidden) return;
@@ -2167,10 +2298,10 @@
         await this.engine.reset(this.quality.codecs);
         if (this.destroyed || generation !== this.generation) return;
 
-        const bytes = await this.fetchSessionSegment(index, generation);
+        const { bytes, init } = await this.fetchSessionSegment(index, generation);
         if (this.destroyed || generation !== this.generation) return;
 
-        this.engine.pushTs(bytes, segment.start);
+        this.engine.pushSegment(bytes, segment.start, init);
         await this.engine.waitIdle();
         if (this.destroyed || generation !== this.generation) return;
         if (this.engine.lastError) throw this.engine.lastError;
@@ -2204,10 +2335,11 @@
     async fetchSessionSegment(index, generation) {
       const segment = this.session.segments[index];
       if (!segment) throw new AppError('NOT_READY');
-      if (this.session.kind === 'live') {
-        return await this.session.getSegmentBytes(index);
-      }
-      return await this.fetchSegmentWithRetry(segment.url, generation);
+      const bytes = this.session.kind === 'live'
+        ? await this.session.getSegmentBytes(index)
+        : await this.fetchSegmentWithRetry(segment.url, generation);
+      if (this.destroyed || generation !== this.generation) throw new AppError('STALE');
+      return { bytes, init: await this.session.initBytesFor(index) };
     }
 
     async fetchSegmentWithRetry(url, generation) {
@@ -2317,8 +2449,9 @@
 
           const generation = this.generation;
           let bytes;
+          let init;
           try {
-            bytes = await this.fetchSessionSegment(index, generation);
+            ({ bytes, init } = await this.fetchSessionSegment(index, generation));
           } catch (error) {
             if (this.destroyed || generation !== this.generation) continue;
             if (error.code === 'NOT_READY') {
@@ -2352,7 +2485,7 @@
           if (buffered.end >= segment.start + segment.dur - 0.2) {
             continue;
           }
-          this.engine.pushTs(bytes, segment.start);
+          this.engine.pushSegment(bytes, segment.start, init);
           await this.engine.waitIdle();
         } catch (error) {
           if (this.destroyed) return;
@@ -2583,11 +2716,11 @@
       if (promise && promise.catch) {
         promise.catch(() => {
           if (this.destroyed || !this.wantPlay || token !== this.playToken) return;
-          this.video.muted = true;
-          this.unmuteBtn.hidden = false;
-          this.updateVolumeUi();
-          const retry = this.video.play();
-          if (retry && retry.catch) retry.catch(() => { /* ignored */ });
+          // Blocked autoplay is answered with a visible play button, never by muting
+          // the stream behind the user's back.
+          this.wantPlay = false;
+          this.setSpinner(false);
+          this.showToast('Нажмите воспроизведение, чтобы продолжить со звуком', 6000);
           this.updateUi();
         });
       }
@@ -2842,6 +2975,7 @@
       if (this.destroyed) return;
       const code = error && error.code ? error.code : 'UNKNOWN';
       console.warn('[TwitchDVR] failure', code, error);
+      this.app.failedCode = code;
       this.app.useNative({
         message: `DVR остановлен из-за ошибки (${code}). Включён стандартный плеер; кнопка DVR попробует снова.`,
         persist: false,
@@ -2900,6 +3034,8 @@
       this.toastEl = null;
       this.toastTimer = null;
       this.startAttempts = 0;
+      this.failedCode = null;
+      this.enableTimer = null;
       this.readyCandidate = null;
       this.readySince = 0;
       cleanupLiveStorage();
@@ -2933,8 +3069,20 @@
     tick() {
       const login = channelLoginFromPath(location.pathname);
       const container = findPlayerContainer();
-      if (!login || !container) {
+      if (!login) {
         this.teardown();
+        return;
+      }
+      if (!container) {
+        if (this.login !== login) {
+          this.teardown();
+          this.login = login;
+          this.startAttempts = 0;
+          this.readyCandidate = null;
+        }
+        this.container = null;
+        if (this.player) this.destroyPlayer();
+        if (!this.loading) this.ensureFab();
         return;
       }
       if (this.login !== login) {
@@ -2984,6 +3132,7 @@
       const container = this.container;
       if (!login || !container || !container.isConnected) return;
       this.loading = true;
+      if (this.fab) this.fab.textContent = 'DVR…';
       let player = null;
       try {
         player = new DvrPlayer(this, login, container);
@@ -2996,19 +3145,32 @@
         this.failedLogin = null;
         this.retryAt = 0;
         this.startAttempts = 0;
+        this.failedCode = null;
+        clearTimeout(this.enableTimer);
+        this.enableTimer = null;
         if (this.fab) this.fab.hidden = true;
         if (this.toastEl) this.toastEl.hidden = true;
       } catch (error) {
-        if (player) player.destroy();
         const code = error && error.code ? error.code : 'UNKNOWN';
+        const nextQuality = this.nextQualityAfterError(player, code);
+        if (player) player.destroy();
         console.warn('[TwitchDVR] start failed:', code, error);
-        if (code === 'MEDIA' || code === 'VIDEO') {
+        this.failedCode = code;
+        clearTimeout(this.enableTimer);
+        this.enableTimer = null;
+        if (nextQuality && this.startAttempts < 3) {
           this.startAttempts += 1;
-          if (this.startAttempts < 3) {
-            this.failedLogin = login;
-            this.retryAt = Date.now() + 3000;
-            return;
-          }
+          storeSet(STORAGE.quality, nextQuality);
+          this.failedLogin = login;
+          this.retryAt = Date.now() + 1500;
+          this.toast(`Ошибка воспроизведения (${code}). Пробую качество ${nextQuality}…`);
+          return;
+        }
+        if (!nextQuality && (code === 'MEDIA' || code === 'VIDEO') && this.startAttempts < 1) {
+          this.startAttempts += 1;
+          this.failedLogin = login;
+          this.retryAt = Date.now() + 2000;
+          return;
         }
         const message = errorMessage(code);
         if (code === 'STREAM_OFFLINE') {
@@ -3018,12 +3180,21 @@
         } else {
           this.failedLogin = login;
           this.retryAt = 0;
-          if (message) this.toast(message);
+          if (message) this.toast(`${message} Код: ${code}.`);
           this.ensureFab();
         }
       } finally {
         this.loading = false;
       }
+    }
+
+    nextQualityAfterError(player, code) {
+      if (!player || !player.session || !player.quality) return null;
+      if (!['MEDIA', 'VIDEO', 'CODEC', 'APPEND', 'TRANSMUX', 'INIT'].includes(code)) return null;
+      const variants = player.session.variants || [];
+      const index = variants.indexOf(player.quality);
+      const next = index >= 0 ? variants[index + 1] : null;
+      return next && next.label ? next.label : null;
     }
 
     restart() {
@@ -3039,11 +3210,6 @@
       if (options.reload === false) {
         this.failedLogin = this.login;
         this.retryAt = 0;
-        if (storeGet(STORAGE.startMuted) !== '0') {
-          try {
-            document.querySelectorAll('.video-player video').forEach((video) => { video.muted = true; });
-          } catch { /* ignored */ }
-        }
         if (this.container) this.ensureFab();
         if (options.message) this.toast(options.message);
         return;
@@ -3059,9 +3225,22 @@
       this.failedLogin = null;
       this.retryAt = 0;
       this.startAttempts = 0;
-      this.loading = false;
+      this.failedCode = null;
+      if (this.fab) this.updateFabState();
       if (this.toastEl) this.toastEl.hidden = true;
-      this.tick();
+      const login = this.login;
+      if (!this.loading) this.tick();
+      clearTimeout(this.enableTimer);
+      this.enableTimer = setTimeout(() => {
+        this.enableTimer = null;
+        if (this.player || this.loading || (login && this.login !== login) || (login && this.failedLogin === login)) return;
+        if (!this.container || !this.container.isConnected) {
+          this.toast('Twitch ещё не показал плеер на этой странице. Нажмите DVR, когда он появится.');
+          this.ensureFab();
+          return;
+        }
+        this.startPlayer();
+      }, 3000);
     }
 
     destroyPlayer() {
@@ -3072,87 +3251,91 @@
     }
 
     ensureFab() {
-      if (!this.container || !this.container.isConnected) return;
-      if (this.ensureNativeDvrButton()) {
-        if (this.fab) this.fab.hidden = true;
-        return;
-      }
+      document.querySelectorAll('.tdvr-native-button').forEach((button) => button.remove());
       if (!this.fab) {
         this.fab = document.createElement('button');
         this.fab.type = 'button';
-        this.fab.className = 'tdvr-fab';
+        this.fab.className = 'tdvr-fab tdvr-fab-floating';
         this.fab.textContent = 'DVR';
         this.fab.title = 'Включить DVR-плеер';
+        Object.assign(this.fab.style, {
+          position: 'fixed',
+          right: 'auto',
+          bottom: 'auto',
+          zIndex: '2147483000',
+        });
         this.fab.addEventListener('click', (event) => {
           event.preventDefault();
           event.stopPropagation();
           this.enableDvr();
         });
       }
-      if (this.fab.parentElement !== this.container) this.container.appendChild(this.fab);
-      this.fab.hidden = false;
+      if (this.fab.parentElement !== document.body) document.body.appendChild(this.fab);
+      this.positionFab();
+      this.updateFabState();
     }
 
-    nativeControlScopes() {
-      const scopes = [];
-      if (this.container && this.container.isConnected) scopes.push(this.container);
-      const player = document.querySelector('.persistent-player .video-player');
-      if (player) scopes.push(player);
-      const overlay = document.querySelector('.video-player__container');
-      if (overlay) scopes.push(overlay);
-      return [...new Set(scopes)];
-    }
+    positionFab() {
+      if (!this.fab) return;
+      if (!this.container || !this.container.isConnected) {
+        this.fab.style.left = 'auto';
+        this.fab.style.right = '24px';
+        this.fab.style.top = 'auto';
+        this.fab.style.bottom = '24px';
+        this.fab.hidden = false;
+        return;
+      }
+      const rect = this.container.getBoundingClientRect();
+      if (rect.width < 20 || rect.height < 20
+        || rect.bottom < 0 || rect.top > window.innerHeight
+        || rect.right < 0 || rect.left > window.innerWidth) {
+        this.fab.hidden = true;
+        return;
+      }
+      const width = this.fab.offsetWidth || 48;
+      const height = this.fab.offsetHeight || 28;
+      let left = rect.right - width - 12;
+      let top = rect.bottom - height - 52;
 
-    findNativeControlAnchor() {
-      for (const scope of this.nativeControlScopes()) {
+      const scopes = [
+        this.container,
+        document.querySelector('.persistent-player'),
+        document.querySelector('.video-player__container'),
+      ].filter(Boolean);
+      for (const scope of scopes) {
         let settings = scope.querySelector('[data-a-target="player-settings-button"]');
         if (!settings) {
           settings = scope.querySelector('button[aria-label*="Настройки"], button[aria-label*="Settings"]');
         }
-        if (settings && settings.parentElement) {
-          const first = settings.parentElement.querySelector('button');
-          return { parent: settings.parentElement, before: first || settings, template: settings };
-        }
-        let fullscreen = scope.querySelector('[data-a-target="player-fullscreen-button"]');
-        if (!fullscreen) {
-          fullscreen = scope.querySelector('button[aria-label*="полноэкран"], button[aria-label*="Fullscreen"]');
-        }
-        if (fullscreen && fullscreen.parentElement) {
-          const first = fullscreen.parentElement.querySelector('button');
-          return { parent: fullscreen.parentElement, before: first || fullscreen, template: fullscreen };
+        if (!settings || !settings.parentElement) continue;
+        const first = settings.parentElement.querySelector('button') || settings;
+        const target = first.getBoundingClientRect();
+        if (target.width > 0 && target.height > 0
+          && target.top >= rect.top - 1 && target.bottom <= rect.bottom + 1) {
+          left = target.left - width - 6;
+          top = target.top + (target.height - height) / 2;
+          break;
         }
       }
-      return null;
+
+      left = clamp(left, rect.left + 8, rect.right - width - 8);
+      top = clamp(top, rect.top + 8, rect.bottom - height - 8);
+      this.fab.style.left = `${Math.round(left)}px`;
+      this.fab.style.top = `${Math.round(top)}px`;
+      this.fab.style.right = 'auto';
+      this.fab.style.bottom = 'auto';
+      this.fab.hidden = false;
     }
 
-    ensureNativeDvrButton() {
-      const anchor = this.findNativeControlAnchor();
-      if (!anchor) return false;
-      const existing = anchor.parent.querySelector('.tdvr-native-button');
-      if (existing && existing.nextElementSibling === anchor.before) return true;
-      if (existing) existing.remove();
-      document.querySelectorAll('.tdvr-native-button').forEach((button) => button.remove());
-
-      const templateClass = typeof anchor.template.className === 'string'
-        ? anchor.template.className
-        : (anchor.template.getAttribute('class') || '');
-      const button = document.createElement('button');
-      button.type = 'button';
-      button.className = `${templateClass} tdvr-native-button`.trim();
-      button.setAttribute('aria-label', 'DVR — включить перемотку эфира');
-      button.title = 'DVR — перемотка эфира';
-      button.innerHTML = '<span class="tdvr-native-label">DVR</span>';
-      button.addEventListener('click', (event) => {
-        event.preventDefault();
-        event.stopPropagation();
-        this.enableDvr();
-      });
-      anchor.parent.insertBefore(button, anchor.before);
-      return true;
-    }
-
-    hideFab() {
-      if (this.fab) this.fab.hidden = true;
+    updateFabState() {
+      if (!this.fab) return;
+      const code = this.failedCode;
+      this.fab.textContent = code ? `DVR · ${code}` : 'DVR';
+      this.fab.classList.toggle('tdvr-fab-error', !!code);
+      this.fab.title = code
+        ? `DVR: ошибка ${code}. Нажмите, чтобы повторить.`
+        : 'Включить DVR-плеер';
+      this.fab.setAttribute('aria-label', code ? `DVR, ошибка ${code}, повторить` : 'Включить DVR-плеер');
     }
 
     teardown() {
@@ -3161,6 +3344,9 @@
         this.fab.remove();
         this.fab = null;
       }
+      clearTimeout(this.enableTimer);
+      this.enableTimer = null;
+      this.failedCode = null;
       document.querySelectorAll('.tdvr-native-button').forEach((button) => button.remove());
       this.login = null;
       this.container = null;

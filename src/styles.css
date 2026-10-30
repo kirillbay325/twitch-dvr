@@ -110,6 +110,22 @@
   margin-left: 3px;
 }
 
+#tdvr-root .tdvr-dvr-badge {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  height: 24px;
+  padding: 0 7px;
+  border: 1px solid rgba(143, 176, 204, 0.28);
+  border-radius: 7px;
+  background: var(--tdvr-accent-soft);
+  color: var(--tdvr-accent-strong);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 1px;
+  pointer-events: none;
+}
+
 #tdvr-root .tdvr-unmute {
   position: absolute;
   left: 12px;
@@ -704,6 +720,18 @@
   background: #1e222a;
   border-color: #3e4653;
   color: #aecbe2;
+}
+
+.tdvr-fab.tdvr-fab-error {
+  background: #241b1a;
+  border-color: #70463f;
+  color: #f2cbc4;
+}
+
+.tdvr-fab.tdvr-fab-error:hover {
+  background: #2d2220;
+  border-color: #8a574d;
+  color: #ffe0da;
 }
 
 .tdvr-fab[hidden] {
